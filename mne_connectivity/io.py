@@ -1,20 +1,17 @@
 import numpy as np
 import xarray as xr
+
 from mne.utils import _prepare_read_metadata
 
-from .base import (
-    Connectivity,
-    EpochConnectivity,
-    EpochSpectralConnectivity,
-    EpochSpectroTemporalConnectivity,
-    EpochTemporalConnectivity,
-    SpectralConnectivity,
-    SpectroTemporalConnectivity,
-    TemporalConnectivity,
-)
+from .base import (Connectivity, EpochConnectivity, EpochSpectralConnectivity,
+                   EpochSpectroTemporalConnectivity, EpochTemporalConnectivity,
+                   SpectralConnectivity, SpectroTemporalConnectivity,
+                   TemporalConnectivity, BaseMultivariateConnectivity,
+                   MultivariateSpectralConnectivity,
+                   MultivariateSpectroTemporalConnectivity)
 
 
-def _xarray_to_conn(array, cls_func):
+def _xarray_to_conn(array, cls_func, restore_attrs):
     """Create connectivity class from xarray.
 
     Parameters
@@ -23,6 +20,10 @@ def _xarray_to_conn(array, cls_func):
         Xarray containing the connectivity data.
     cls_func : Connectivity class
         The function of the connectivity class to use.
+    restore_attrs : bool
+        Whether or not to restore the nature of attributes of the class that
+        were modified to enable saving with HDF5 (only relevant for multivariate
+        connectivity classes).
 
     Returns
     -------
@@ -36,33 +37,37 @@ def _xarray_to_conn(array, cls_func):
     coords = array.coords
 
     # attach times and frequencies
-    if "times" in coords:
-        array.attrs["times"] = coords.get("times")
-    if "freqs" in coords:
-        array.attrs["freqs"] = coords.get("freqs")
+    if 'times' in coords:
+        array.attrs['times'] = coords.get('times')
+    if 'freqs' in coords:
+        array.attrs['freqs'] = coords.get('freqs')
 
     # get the names
-    names = array.attrs["node_names"]
+    names = array.attrs['node_names']
 
     # get metadata if it's in attrs
-    metadata = array.attrs.pop("metadata")
+    metadata = array.attrs.pop('metadata')
     metadata = _prepare_read_metadata(metadata)
 
     # write event IDs
     # storing events is optional, not all files will have them
-    if "event_id_keys" in array.attrs and "event_id_vals" in array.attrs:
-        event_id_keys = np.atleast_1d(array.attrs.pop("event_id_keys")).tolist()
-        event_id_vals = np.atleast_1d(array.attrs.pop("event_id_vals")).tolist()
+    if 'event_id_keys' in array.attrs and 'event_id_vals' in array.attrs:
+        event_id_keys = np.atleast_1d(
+            array.attrs.pop('event_id_keys')).tolist()
+        event_id_vals = np.atleast_1d(
+            array.attrs.pop('event_id_vals')).tolist()
         event_id = dict(zip(event_id_keys, event_id_vals))
-        array.attrs["event_id"] = event_id
-
-    # convert indices numpy arrays to a tuple of masked arrays
-    # (only multivariate connectivity indices saved as arrays)
-    if isinstance(array.attrs["indices"], np.ndarray):
-        array.attrs["indices"] = tuple(np.ma.masked_values(array.attrs["indices"], -1))
+        array.attrs['event_id'] = event_id
 
     # create the connectivity class
-    conn = cls_func(data=data, names=names, metadata=metadata, **array.attrs)
+    conn = cls_func(
+        data=data, names=names, metadata=metadata, **array.attrs
+    )
+
+    # restore attrs modified for saving (for multivariate connectivity only)
+    if restore_attrs:
+        conn._restore_attrs()
+
     return conn
 
 
@@ -84,29 +89,39 @@ def read_connectivity(fname):
     # complex data types, which was not natively supported
     # in xarray. Therefore, h5netcdf is the only engine
     # to support that feature at this moment.
-    conn_da = xr.open_dataarray(fname, engine="h5netcdf")
+    conn_da = xr.open_dataarray(fname, engine='h5netcdf')
 
     # map 'n/a' to 'None'
     for key, val in conn_da.attrs.items():
         if not isinstance(val, list) and not isinstance(val, np.ndarray):
-            if val == "n/a":
+            if val == 'n/a':
                 conn_da.attrs[key] = None
     # get the name of the class
-    data_structure_name = conn_da.attrs.pop("data_structure")
+    data_structure_name = conn_da.attrs.pop('data_structure')
 
     # map class name to its actual class
     conn_cls = {
-        "Connectivity": Connectivity,
-        "TemporalConnectivity": TemporalConnectivity,
-        "SpectralConnectivity": SpectralConnectivity,
-        "SpectroTemporalConnectivity": SpectroTemporalConnectivity,
-        "EpochConnectivity": EpochConnectivity,
-        "EpochTemporalConnectivity": EpochTemporalConnectivity,
-        "EpochSpectralConnectivity": EpochSpectralConnectivity,
-        "EpochSpectroTemporalConnectivity": EpochSpectroTemporalConnectivity,
+        'Connectivity': Connectivity,
+        'TemporalConnectivity': TemporalConnectivity,
+        'SpectralConnectivity': SpectralConnectivity,
+        'SpectroTemporalConnectivity': SpectroTemporalConnectivity,
+        'EpochConnectivity': EpochConnectivity,
+        'EpochTemporalConnectivity': EpochTemporalConnectivity,
+        'EpochSpectralConnectivity': EpochSpectralConnectivity,
+        'EpochSpectroTemporalConnectivity': EpochSpectroTemporalConnectivity,
+        'MultivariateSpectralConnectivity': MultivariateSpectralConnectivity,
+        'MultivariateSpectroTemporalConnectivity': \
+            MultivariateSpectroTemporalConnectivity
     }
     cls_func = conn_cls[data_structure_name]
 
+    # checks whether ragged attrs of the class padded for saving need to be
+    # restored (so far only the case for multivariate connectivity)
+    if issubclass(cls_func, BaseMultivariateConnectivity):
+        restore_attrs = True
+    else:
+        restore_attrs = False
+
     # get the data as a new connectivity container
-    conn = _xarray_to_conn(conn_da, cls_func)
+    conn = _xarray_to_conn(conn_da, cls_func, restore_attrs)
     return conn

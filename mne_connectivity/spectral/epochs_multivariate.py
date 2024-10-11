@@ -1,1195 +1,1409 @@
-# Authors: Martin Luessi <mluessi@nmr.mgh.harvard.edu>
-#          Denis A. Engemann <denis.engemann@gmail.com>
-#          Adam Li <adam2392@gmail.com>
-#          Thomas S. Binns <t.s.binns@outlook.com>
-#          Tien D. Nguyen <tien-dung.nguyen@charite.de>
+# Authors: Thomas Samuel Binns <t.s.binns@outlook.com>
+#          Tien Dung Nguyen <>
 #          Richard M. Köhler <koehler.richard@charite.de>
-#          Mohammad Orabe <orabe.mhd@gmail.com>
-#          Mina Jamshidi Idaji <minajamshidi91@gmail.com>
 #
 # License: BSD (3-clause)
 
-import copy
 import inspect
-
+import copy
 import numpy as np
-from mne.epochs import BaseEpochs
+from mne import BaseEpochs
 from mne.parallel import parallel_func
-from mne.time_frequency import EpochsSpectrum, EpochsSpectrumArray
-from mne.time_frequency.multitaper import _psd_from_mt
-from mne.utils import ProgressBar, _validate_type, logger
+from mne.utils import _arange_div, logger, ProgressBar, _time_mask
+from ..base import (
+    MultivariateSpectralConnectivity, MultivariateSpectroTemporalConnectivity
+)
+from .epochs import (
+    _assemble_spectral_params, _check_estimators, _compute_freqs,
+    _compute_freq_mask, _epoch_spectral_connectivity,
+    _get_and_verify_data_sizes, _get_n_epochs, _prepare_connectivity
+)
 
 
-def _check_rank_input(rank, data, indices):
-    """Check the rank argument is appropriate and compute rank if missing."""
-    sv_tol = 1e-6  # tolerance for non-zero singular val (rel. to largest)
-    if rank is None:
-        rank = np.zeros((2, len(indices[0])), dtype=int)
+class _MVCSpectralEpochs():
+    """Computes multivariate spectral connectivity of epoched data for the
+    multivariate_spectral_connectivity_epochs function."""
 
-        if isinstance(data, BaseEpochs):
-            # XXX: remove logic once support for mne<1.6 is dropped
-            kwargs = dict()
-            if "copy" in inspect.getfullargspec(data.get_data).kwonlyargs:
-                kwargs["copy"] = False
-            data_arr = data.get_data(**kwargs)
-        elif isinstance(data, EpochsSpectrum | EpochsSpectrumArray):
-            # Spectrum objs will drop bad channels, so specify picking all channels
-            data_arr = data.get_data(picks=np.arange(data.info["nchan"]))
-            # Convert to power (and aggregate over tapers) before computing rank
-            if "taper" in data._dims:
-                data_arr = _psd_from_mt(data_arr, data.weights)
+    init_attrs = [
+        'data', 'indices', 'names', 'method', 'sfreq', 'mode', 'tmin', 'tmax',
+        'fmin', 'fmax', 'fskip', 'faverage', 'cwt_freqs', 'mt_bandwidth',
+        'mt_adaptive', 'mt_low_bias', 'cwt_n_cycles', 'n_components',
+        'gc_n_lags', 'block_size', 'n_jobs', 'verbose'
+    ]
+
+    gc_method_aliases = ['gc', 'net_gc', 'trgc', 'net_trgc']
+    gc_method_names = ['GC', 'Net GC', 'TRGC', 'Net TRGC']
+    
+    # possible forms of GC with information on how to use the methods
+    possible_gc_forms = {
+        'seeds -> targets': dict(
+            flip_seeds_targets=False, reverse_time=False,
+            for_methods=['GC', 'Net GC', 'TRGC', 'Net TRGC'], method_class=None
+        ),
+        'targets -> seeds': dict(
+            flip_seeds_targets=True, reverse_time=False,
+            for_methods=['Net GC', 'Net TRGC'], method_class=None
+        ),
+        'time-reversed[seeds -> targets]': dict(
+            flip_seeds_targets=False, reverse_time=True,
+            for_methods=['TRGC', 'Net TRGC'], method_class=None
+        ),
+        'time-reversed[targets -> seeds]': dict(
+            flip_seeds_targets=True, reverse_time=True,
+            for_methods=['Net TRGC'], method_class=None
+        )
+    }
+
+    # possible forms of coherence with information on how to use the methods
+    possible_coh_forms = {
+        'MIC & MIM': dict(
+            for_methods=['MIC', 'MIM'], exclude_methods=[], method_class=None
+        ),
+        'MIC': dict(
+            for_methods=['MIC'], exclude_methods=['MIM'], method_class=None
+        ),
+        'MIM': dict(
+            for_methods=['MIM'], exclude_methods=['MIC'], method_class=None
+        )
+    }
+
+    # threshold for classifying singular values as being non-zero
+    rank_nonzero_tol = 1e-5
+    perform_svd = False
+
+    # whether the requested frequencies are discontinuous (e.g. different bands)
+    discontinuous_freqs = False
+
+    # whether or not GC must be computed separately from other methods
+    compute_gc_separately = False
+
+    # storage for GC results if SVD used or freqs are discontinuous (which must
+    # be computed separately from other methods)
+    separate_gc_method_types = []
+    separate_gc_con = []
+    separate_gc_topo = []
+
+    # storage for coherence results (and GC results if no SVD used and requested
+    # frequencies are continuous)
+    remaining_con = []
+    remaining_topo = []
+
+    def __init__(self, **kwargs):
+        assert all(attr in self.init_attrs for attr in kwargs.keys()), (
+            'Not all inputs to the _MVCSpectralEpochs class have been '
+            'provided. Please contact the mne-connectivity developers.'
+        )
+        for name, value in kwargs.items():
+            assert name in self.init_attrs, (
+                'An input to the _MVCSpectralEpochs class is not recognised. '
+                'Please contact the mne-connectivity developers.'
+            )
+            setattr(self, name, value)
+        
+        self._sort_inputs()
+    
+    def _sort_inputs(self):
+        """Checks the format of the input parameters and enacts them to create
+        new object attributes."""
+        self._sort_parallelisation_inputs()
+        self._sort_data_info()
+        self._sort_estimator_inputs()
+        self._sort_freq_inputs()
+        self._sort_indices_inputs()
+        self._sort_svd_inputs()
+
+        if self.perform_svd or self.discontinuous_freqs:
+            self.compute_gc_separately = True
+    
+    def _sort_parallelisation_inputs(self):
+        """Establishes parallelisation of the function for computing the CSD if 
+        n_jobs > 1, else uses the standard, non-parallelised function."""
+        self.parallel, self._epoch_spectral_connectivity, _ = (
+            parallel_func(
+                _epoch_spectral_connectivity, self.n_jobs, verbose=self.verbose
+            )
+        )
+    
+    def _sort_data_info(self):
+        """Extracts information stored in the data if it is an Epochs object,
+        otherwise sets this information to `None`."""
+        if isinstance(self.data, BaseEpochs):
+            self.names = self.data.ch_names
+            self.times_in = self.data.times  # input times for Epochs input type
+            self.sfreq = self.data.info['sfreq']
+
+            self.events = self.data.events
+            self.event_id = self.data.event_id
+
+            # Extract metadata from the Epochs data structure.
+            # Make Annotations persist through by adding them to the metadata.
+            metadata = self.data.metadata
+            if metadata is None:
+                self.annots_in_metadata = False
             else:
-                data_arr = (data_arr * data_arr.conj()).real
-        else:
-            data_arr = data
-
-        for group_i in range(2):  # seeds and targets
-            for con_i, con_idcs in enumerate(indices[group_i]):
-                s = np.linalg.svd(data_arr[:, con_idcs.compressed()], compute_uv=False)
-                rank[group_i][con_i] = np.min(
-                    [np.count_nonzero(epoch >= epoch[0] * sv_tol) for epoch in s]
+                self.annots_in_metadata = all(
+                    name not in metadata.columns for name in 
+                    ['annot_onset', 'annot_duration', 'annot_description']
                 )
+            if (
+                hasattr(self.data, 'annotations') and not
+                self.annots_in_metadata
+            ):
+                self.data.add_annotations_to_metadata(overwrite=True)
+            self.metadata = self.data.metadata
+        else:
+            self.times_in = None
+            self.events = None
+            self.event_id = None
+            self.metadata = None
 
-        logger.info("Estimated data ranks:")
-        con_i = 1
-        for seed_rank, target_rank in zip(rank[0], rank[1]):
-            logger.info(
-                f"    connection {con_i} - seeds {seed_rank}; targets {target_rank}"
-            )
-            con_i += 1
-        rank = tuple((np.array(rank[0]), np.array(rank[1])))
+    def _sort_estimator_inputs(self):
+        """Assign names to connectivity methods, check the methods and mode are
+        recognised, and finds which Granger causality methods are being
+        called."""
+        if not isinstance(self.method, (list, tuple)):
+            self.method = [self.method]  # make it a list so we can iterate
 
-    else:
+        self.con_method_types, _, _, _ = _check_estimators(
+            self.method, self.mode
+        )
+        metrics_str = ', '.join([meth.name for meth in self.con_method_types])
+        logger.info(
+            '    the following metrics will be computed: %s' % metrics_str
+        )
+
+        # find which Granger causality methods are being called
+        self.present_gc_methods = [
+            con_method for con_method in self.method
+            if con_method in self.gc_method_aliases
+        ]
+
+        self.remaining_method_types = copy.deepcopy(self.con_method_types)
+
+    def _sort_freq_inputs(self):
+        """Formats frequency-related inputs and checks they are appropriate."""
+        if self.fmin is None:
+            self.fmin = -np.inf  # set it to -inf, so we can adjust it later
+
+        self.fmin = np.array((self.fmin,), dtype=float).ravel()
+        self.fmax = np.array((self.fmax,), dtype=float).ravel()
+        if len(self.fmin) != len(self.fmax):
+            raise ValueError('fmin and fmax must have the same length')
+        if np.any(self.fmin > self.fmax):
+            raise ValueError('fmax must be larger than fmin')
+
+        self.n_bands = len(self.fmin)
+
+        if self.present_gc_methods:
+            self._check_for_discontinuous_freqs()
+
+    def _check_for_discontinuous_freqs(self):
+        """Checks whether the requested frequencies to analyse are
+        discontinuous (occurs in the case that different frequency bands are
+        specified in fmin and fmax, but there is a gap between the boundaries of
+        each frequency band). The state-space GC method used has a
+        cross-frequency relationship which would be disrupted by computing
+        connectivity on a discontinuous set of frequencies, so this checks to
+        see if GC needs to be computed separately on a continuous set of
+        frequencies spanning from the lowest fmin and highest fmax values which
+        can then be split into the specified frequency bands.
+        
+        A simpler check would be to set discontinuous = True if n_bands > 1,
+        however it could be the case that the bands are continuous, e.g. 8-12 Hz
+        and 13-20 Hz (with a freq. resolution of 1 Hz), in which case the
+        frequencies are not discontinuous and GC can be computed alongside other
+        methods.
+        """
+        n_times = self._get_n_used_times()
+        # compute frequencies to analyze based on number of samples, sampling
+        # rate, specified wavelet frequencies and mode
+        freqs = _compute_freqs(n_times, self.sfreq, self.cwt_freqs, self.mode)
+        # compute the mask based on specified min/max and decimation factor
+        freq_mask = _compute_freq_mask(freqs, self.fmin, self.fmax, 0)
+
+        # formula for finding if indices of freqs being analysed is continuous;
+        # array should not contain repeats (but that should always be the
+        # case for these frequency indices) and should start from 1 (we make
+        # this adjustment)
+        use_freqs = np.nonzero(freq_mask)[0]
+        use_freqs = (use_freqs - min(use_freqs)) + 1 # need to start from 1
         if (
-            len(rank) != 2
-            or len(rank[0]) != len(indices[0])
-            or len(rank[1]) != len(indices[1])
+            sum(np.arange(1, len(use_freqs) + 1)) !=
+            use_freqs[-1] * (use_freqs[-1] + 1) / 2
         ):
-            raise ValueError(
-                "rank argument must have shape (2, n_cons), according to n_cons in the "
-                "indices"
+            assert self.n_bands != 1, (
+                'Frequencies have been detected as discontinuous, yet there is '
+                'only a single frequency band in the data. Please contact the '
+                'mne-connectivity developers.'
             )
-        for seed_idcs, target_idcs, seed_rank, target_rank in zip(
-            indices[0], indices[1], rank[0], rank[1]
-        ):
-            if not (
-                0 < seed_rank <= len(seed_idcs) and 0 < target_rank <= len(target_idcs)
+            self.discontinuous_freqs = True
+
+    def _get_n_used_times(self):
+        """Finds and returns the number of timepoints being examined in the
+        data."""
+        if self.times_in is None:
+            if isinstance(self.data, BaseEpochs):
+                n_times = self.data.get_data().shape[2]
+            else:
+                n_times = self.data.shape[2]
+            times = _arange_div(n_times, self.sfreq)
+        else:
+            times = self.times_in
+
+        time_mask = _time_mask(times, self.tmin, self.tmax, sfreq=self.sfreq)
+        tmin_idx, tmax_idx = np.where(time_mask)[0][[0, -1]]
+
+        return len(times[tmin_idx : tmax_idx + 1])
+
+    def _sort_indices_inputs(self):
+        """Checks that the indices are appropriate and sets the number of seeds
+        and targets in each connection."""
+        if self.indices is None:
+            raise ValueError('indices must be specified, got `None`')
+
+        if len(self.indices[0]) != len(self.indices[1]):
+            raise ValueError(
+                f'the number of seeds ({len(self.indices[0])}) and targets '
+                f'({len(self.indices[1])}) must match'
+            )
+        self.n_cons = len(self.indices[0])
+
+        for seeds, targets in zip(self.indices[0], self.indices[1]):
+            if not isinstance(seeds, list) or not isinstance(targets, list):
+                raise TypeError(
+                    'seeds and targets for each connection must be given as a '
+                    'list of ints'
+                )
+            if (
+                not all(isinstance(seed, int) for seed in seeds) or
+                not all(isinstance(target, int) for target in targets)
+            ):
+                raise TypeError(
+                    'seeds and targets for each connection must be given as a '
+                    'list of ints'
+                )
+            if (
+                any(method in self.method for method in self.gc_method_aliases)
+                and set.intersection(set(seeds), set(targets))
             ):
                 raise ValueError(
-                    "ranks for seeds and targets must be > 0 and <= the number of "
-                    "channels in the seeds and targets, respectively, for each "
-                    "connection"
+                    'there are common indices present in the seeds and targets '
+                    'for a single connection, however connectivity between '
+                    'shared channels is not supported for Granger causality'
                 )
-
-    return rank
-
-
-def _check_n_components_input(n_components, rank):
-    """Check the n_components argument is appropriate based on the rank of the data."""
-    if n_components is None:
-        return np.min(rank)
-
-    _validate_type(n_components, "int-like", "`n_components`", "int")
-    if n_components > np.min(rank):
-        raise ValueError("`n_components` is greater than the minimum rank of the data")
-    if n_components < 1:
-        raise ValueError("`n_components` must be >= 1")
-
-    return n_components
-
-
-########################################################################
-# Multivariate connectivity estimators
-
-
-class _AbstractConEstBase:
-    """ABC for connectivity estimators."""
-
-    def start_epoch(self):
-        raise NotImplementedError("start_epoch method not implemented")
-
-    def accumulate(self, con_idx, csd_xy):
-        raise NotImplementedError("accumulate method not implemented")
-
-    def combine(self, other):
-        raise NotImplementedError("combine method not implemented")
-
-    def compute_con(self, con_idx, n_epochs):
-        raise NotImplementedError("compute_con method not implemented")
-
-
-class _EpochMeanMultivariateConEstBase(_AbstractConEstBase):
-    """Base class for mean epoch-wise multivar. con. estimation methods."""
-
-    name = None
-    n_steps = None
-    con_scores = None
-    patterns = None
-    filters = None
-    con_scores_dtype = np.float64
-
-    def __init__(
-        self,
-        n_signals,
-        n_cons,
-        n_freqs,
-        n_times,
-        *,
-        n_components=0,
-        store_con=True,
-        store_filters=False,
-        n_jobs=1,
-    ):
-        self.n_signals = n_signals
-        self.n_cons = n_cons
-        self.n_freqs = n_freqs
-        self.n_times = n_times
-        self.n_components = n_components
-        self.store_con = store_con
-        self.store_filters = store_filters
-        self.n_jobs = n_jobs
-
-        # allocate space for accumulation of CSD
-        csd_shape = (n_signals**2, n_freqs, 1 if n_times == 0 else n_times)
-        self._acc = np.zeros(csd_shape, dtype=np.complex128)
-        if n_times == 0:
-            self._acc = np.squeeze(self._acc, axis=-1)
-
-        # allocate space for storing results
-        # include time & components dimensions for indexing flexibility, even if unused
-        if store_con:
-            self.con_scores = np.zeros(
-                (
-                    n_cons,
-                    1 if n_components == 0 else n_components,
-                    n_freqs,
-                    1 if n_times == 0 else n_times,
-                ),
-                dtype=self.con_scores_dtype,
-            )
-
-        self._compute_n_progress_bar_steps()
-
-    def start_epoch(self):  # noqa: D401
-        """Call at the start of each epoch."""
-        pass  # for this type of con. method we don't do anything
-
-    def combine(self, other):
-        """Include con. accumulated for some epochs in this estimate."""
-        self._acc += other._acc
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate CSD for some connections."""
-        self._acc[con_idx] += csd_xy
-
-    def _compute_n_progress_bar_steps(self):
-        """Calculate the number of steps to include in the progress bar."""
-        self.n_steps = int(np.ceil(self.n_freqs / self.n_jobs))
-
-    def _log_connection_number(self, con_i):
-        """Log the number of the connection being computed."""
-        logger.info(
-            f"Computing {self.name} for connection {con_i + 1} of {self.n_cons}"
-        )
-
-    def _get_block_indices(self, block_i, limit):
-        """Get indices for a computation block capped by a limit."""
-        indices = np.arange(block_i * self.n_jobs, (block_i + 1) * self.n_jobs)
-
-        return indices[np.nonzero(indices < limit)]
-
-    def reshape_csd(self):
-        """Reshape CSD into a matrix of times x freqs x signals x signals."""
-        if self.n_times == 0:
-            return np.reshape(
-                self._acc, (self.n_signals, self.n_signals, self.n_freqs, 1)
-            ).transpose(3, 2, 0, 1)
-
-        return np.reshape(
-            self._acc, (self.n_signals, self.n_signals, self.n_freqs, self.n_times)
-        ).transpose(3, 2, 0, 1)
-
-    def reshape_results(self):
-        """Remove time & component dimensions from results, if necessary."""
-        # results have shape (n_cons, n_components, n_freqs, n_times)
-        if self.con_scores is not None:
-            squeeze_dims = []
-            squeeze_dims.append(1) if self.n_components == 0 else None
-            squeeze_dims.append(3) if self.n_times == 0 else None
-            self.con_scores = np.squeeze(self.con_scores, axis=tuple(squeeze_dims))
-
-        # filters and patterns (2, n_cons, n_components, n_signals, n_freqs, n_times)
-        if self.patterns is not None or self.filters is not None:
-            squeeze_dims = []
-            squeeze_dims.append(2) if self.n_components == 0 else None
-            squeeze_dims.append(5) if self.n_times == 0 else None
-            if self.patterns is not None:
-                self.patterns = np.squeeze(self.patterns, axis=tuple(squeeze_dims))
-            if self.filters is not None:
-                self.filters = np.squeeze(self.filters, axis=tuple(squeeze_dims))
-
-
-class _MultivariateCohEstBase(_EpochMeanMultivariateConEstBase):
-    """Base estimator for multivariate coherency methods.
-
-    See:
-    - Imaginary part of coherency, i.e. maximised imaginary part of
-    coherency (MIC) and multivariate interaction measure (MIM): Ewald et al.
-    (2012). NeuroImage. DOI: 10.1016/j.neuroimage.2011.11.084
-    - Coherency/coherence, i.e. canonical coherency (CaCoh): Vidaurre et al.
-    (2019). NeuroImage. DOI: 10.1016/j.neuroimage.2019.116009
-    """
-
-    name: str | None = None
-    accumulate_psd = False
-
-    def __init__(
-        self,
-        n_signals,
-        n_cons,
-        n_freqs,
-        n_times,
-        *,
-        n_components=0,
-        store_con=True,
-        store_filters=False,
-        n_jobs=1,
-    ):
-        super().__init__(
-            n_signals,
-            n_cons,
-            n_freqs,
-            n_times,
-            n_components=n_components,
-            store_con=store_con,
-            store_filters=store_filters,
-            n_jobs=n_jobs,
-        )
-
-    def compute_con(self, indices, ranks, n_epochs=1):
-        """Compute multivariate coherency methods."""
-        assert self.name in ["CaCoh", "MIC", "MIM"], (
-            "the class name is not recognised, please contact the mne-connectivity "
-            "developers"
-        )
-
-        csd = self.reshape_csd() / n_epochs
-        n_times = csd.shape[0]
-        n_components = 1 if self.n_components == 0 else self.n_components
-        times = np.arange(n_times)
-        freqs = np.arange(self.n_freqs)
-
-        if self.name in ["CaCoh", "MIC"]:
-            patterns_filters_shape = (
-                2,  # seeds/targets
-                self.n_cons,  # connections
-                n_components,  # components
-                indices[0].shape[1],  # channels
-                self.n_freqs,  # freqs
-                n_times,  # times
-            )
-            self.patterns = np.full(patterns_filters_shape, np.nan)
-            if self.store_filters:
-                self.filters = np.full(patterns_filters_shape, np.nan)
-
-        con_i = 0
-        for seed_idcs, target_idcs, seed_rank, target_rank in zip(
-            indices[0], indices[1], ranks[0], ranks[1]
-        ):
-            self._log_connection_number(con_i)
-
-            seed_idcs = seed_idcs.compressed()
-            target_idcs = target_idcs.compressed()
-            con_idcs = [*seed_idcs, *target_idcs]
-
-            C = csd[np.ix_(times, freqs, con_idcs, con_idcs)]
-
-            # Eqs. 32 & 33 of Ewald et al.; Eq. 15 of Vidaurre et al.
-            C_bar, U_bar_aa, U_bar_bb = self._csd_svd(
-                C, seed_idcs, seed_rank, target_rank
-            )
-
-            self._compute_con_daughter(
-                seed_idcs, target_idcs, C, C_bar, U_bar_aa, U_bar_bb, con_i
-            )
-
-            con_i += 1
-
-        self.reshape_results()
-
-    def _csd_svd(self, csd, seed_idcs, seed_rank, target_rank):
-        """Dimensionality reduction of CSD with SVD."""
-        n_times = csd.shape[0]
-        n_seeds = len(seed_idcs)
-        n_targets = csd.shape[3] - n_seeds
-
-        C_aa = csd[..., :n_seeds, :n_seeds]
-        C_ab = csd[..., :n_seeds, n_seeds:]
-        C_bb = csd[..., n_seeds:, n_seeds:]
-        C_ba = csd[..., n_seeds:, :n_seeds]
-
-        # Eqs. 32 (Ewald et al.) & 15 (Vidaurre et al.)
-        if seed_rank != n_seeds:
-            U_aa = np.linalg.svd(np.real(C_aa), full_matrices=False)[0]
-            U_bar_aa = U_aa[..., :seed_rank]
+        
+        if isinstance(self.data, BaseEpochs):
+            n_channels = self.data.get_data().shape[1]
         else:
-            U_bar_aa = np.broadcast_to(
-                np.identity(n_seeds), (n_times, self.n_freqs) + (n_seeds, n_seeds)
-            )
-
-        if target_rank != n_targets:
-            U_bb = np.linalg.svd(np.real(C_bb), full_matrices=False)[0]
-            U_bar_bb = U_bb[..., :target_rank]
-        else:
-            U_bar_bb = np.broadcast_to(
-                np.identity(n_targets), (n_times, self.n_freqs) + (n_targets, n_targets)
-            )
-
-        # Eq. 33 (Ewald et al.)
-        C_bar_aa = U_bar_aa.transpose(0, 1, 3, 2) @ (C_aa @ U_bar_aa)
-        C_bar_ab = U_bar_aa.transpose(0, 1, 3, 2) @ (C_ab @ U_bar_bb)
-        C_bar_bb = U_bar_bb.transpose(0, 1, 3, 2) @ (C_bb @ U_bar_bb)
-        C_bar_ba = U_bar_bb.transpose(0, 1, 3, 2) @ (C_ba @ U_bar_aa)
-        C_bar = np.append(
-            np.append(C_bar_aa, C_bar_ab, axis=3),
-            np.append(C_bar_ba, C_bar_bb, axis=3),
-            axis=2,
-        )
-
-        return C_bar, U_bar_aa, U_bar_bb
-
-    def _compute_con_daughter(
-        self, seed_idcs, target_idcs, C, C_bar, U_bar_aa, U_bar_bb, con_i
-    ):
-        """Compute multivariate coherency for one connection.
-
-        An empty method to be implemented by subclasses.
-        """
-
-    def _compute_t(self, C_r, n_seeds):
-        """Compute transformation matrix, T, for frequencies (& times).
-
-        Eq. 3 of Ewald et al.; part of Eq. 9 of Vidaurre et al.
-        """
-        try:
-            return self._invsqrtm(C_r, n_seeds)
-        except np.linalg.LinAlgError as error:
-            raise RuntimeError(
-                "the transformation matrix of the data could not be computed from the "
-                "cross-spectral density; check that you are using full rank data or "
-                "specify an appropriate rank for the seeds and targets that is less "
-                "than or equal to their ranks"
-            ) from error
-
-    def _invsqrtm(self, C_r, n_seeds):
-        """Compute inverse sqrt of CSD over frequencies and times.
-
-        Parameters
-        ----------
-        C_r : np.ndarray, shape=(n_freqs, n_times, n_channels, n_channels)
-            Real part of the CSD. Expected to be symmetric and non-singular.
-        n_seeds : int
-            Number of seed channels for the connection.
-
-        Returns
-        -------
-        T : np.ndarray, shape=(n_freqs, n_times, n_channels, n_channels)
-            Inverse square root of the real-valued CSD. Name comes from Ewald
-            et al. (2012).
-
-        Notes
-        -----
-        This approach is a workaround for computing the inverse square root of
-        an ND array. SciPy has dedicated functions for this purpose, e.g.
-        `sp.linalg.fractional_matrix_power(A, -0.5)` or `sp.linalg.inv(
-        sp.linalg.sqrtm(A))`, however these only work with 2D arrays, meaning
-        frequencies and times must be looped over which is very slow. There are
-        no equivalent functions in NumPy for working with ND arrays (as of
-        v1.26).
-
-        The data array is expected to be symmetric and non-singular, otherwise
-        a LinAlgError is raised.
-
-        See Eq. 3 of Ewald et al. (2012). NeuroImage. DOI:
-        10.1016/j.neuroimage.2011.11.084.
-        """
-        T = np.zeros_like(C_r, dtype=np.float64)
-        times = np.arange(C_r.shape[0])
-        freqs = np.arange(C_r.shape[1])
-        seeds = np.arange(n_seeds)
-        targets = np.arange(n_seeds, C_r.shape[2])
-
-        for chans in (seeds, targets):
-            eigvals, eigvects = np.linalg.eigh(C_r[np.ix_(times, freqs, chans, chans)])
-            n_zero = (eigvals == 0).sum()
-            if n_zero:  # sign of non-full rank data
-                raise np.linalg.LinAlgError(
-                    "Cannot compute inverse square root of rank-deficient matrix with "
-                    f"{n_zero}/{len(eigvals)} zero eigenvalue(s)"
-                )
-            T[np.ix_(times, freqs, chans, chans)] = (
-                eigvects * np.expand_dims(1.0 / np.sqrt(eigvals), axis=2)
-            ) @ eigvects.transpose(0, 1, 3, 2)
-
-        return T
-
-
-class _MultivariateImCohEstBase(_MultivariateCohEstBase):
-    """Base estimator for multivariate imag. part of coherency methods.
-
-    See Ewald et al. (2012). NeuroImage. DOI: 10.1016/j.neuroimage.2011.11.084
-    for equation references.
-    """
-
-    def _compute_con_daughter(
-        self, seed_idcs, target_idcs, C, C_bar, U_bar_aa, U_bar_bb, con_i
-    ):
-        """Compute multivariate imag. part of coherency for one connection."""
-        assert self.name in ["MIC", "MIM"], (
-            "the class name is not recognised, please contact the mne-connectivity "
-            "developers"
-        )
-
-        # Eqs. 3 & 4
-        E = self._compute_e(C_bar, n_seeds=U_bar_aa.shape[3])
-
-        if self.name == "MIC":
-            self._compute_mic(E, C, seed_idcs, target_idcs, U_bar_aa, U_bar_bb, con_i)
-        else:
-            self._compute_mim(E, seed_idcs, target_idcs, con_i)
-
-    def _compute_e(self, C, n_seeds):
-        """Compute E from the CSD."""
-        C_r = np.real(C)
-
-        # Eq. 3
-        T = self._compute_t(C_r, n_seeds)
-
-        # Eq. 4
-        D = T @ (C @ T)
-
-        # E as imag. part of D between seeds and targets
-        return np.imag(D[..., :n_seeds, n_seeds:])
-
-    def _compute_mic(self, E, C, seed_idcs, target_idcs, U_bar_aa, U_bar_bb, con_i):
-        """Compute MIC & spatial patterns for one connection."""
-        n_seeds = len(seed_idcs)
-        n_targets = len(target_idcs)
-        n_components = 1 if self.n_components == 0 else self.n_components
-
-        # Eigendecomp. to find spatial filters for seeds and targets
-        # (flip to get components in descending eigvals. order)
-        alpha = np.flip(
-            np.linalg.eigh(E @ E.transpose(0, 1, 3, 2))[1][..., -n_components:],
-            axis=-1,
-        )
-        beta = np.flip(
-            np.linalg.eigh(E.transpose(0, 1, 3, 2) @ E)[1][..., -n_components:],
-            axis=-1,
-        )
-        if len(seed_idcs) == len(target_idcs) and np.all(
-            np.sort(seed_idcs) == np.sort(target_idcs)
-        ):
-            # strange edge-case where the eigenvectors returned should be a set of
-            # identity matrices with one rotated by 90 degrees, but are instead
-            # identical (i.e. are not rotated versions of one another). This leads to
-            # the case where the spatial filters are incorrectly applied, resulting in
-            # connectivity estimates of ~0 when they should be perfectly correlated ~1.
-            # Accordingly, we manually create a set of rotated identity matrices to use
-            # as the filters.
-            identical_mask = np.all(alpha == beta, axis=(2, 3))
-            beta[identical_mask] = np.flip(beta[identical_mask], axis=(-2, -1))
-
-        # Part of Eqs. 46 & 47; i.e. transform filters to channel space
-        alpha_Ubar = U_bar_aa @ alpha
-        beta_Ubar = U_bar_bb @ beta
-
-        # Eq. 46 (seed spatial patterns)
-        self.patterns[0, con_i, :, :n_seeds] = (
-            np.real(C[..., :n_seeds, :n_seeds]) @ alpha_Ubar
-        ).T
-
-        # Eq. 47 (target spatial patterns)
-        self.patterns[1, con_i, :, :n_targets] = (
-            np.real(C[..., n_seeds:, n_seeds:]) @ beta_Ubar
-        ).T
-
-        if self.store_con:
-            # Eq. 7
-            self.con_scores[con_i] = (
-                np.einsum("ijkl,ijkl->ijl", alpha, E @ beta)
-                / np.linalg.norm(alpha, axis=2)
-                * np.linalg.norm(beta, axis=2)
-            ).T
-
-        if self.store_filters:
-            self.filters[0, con_i, :, :n_seeds] = alpha_Ubar.T
-            self.filters[1, con_i, :, :n_targets] = beta_Ubar.T
-
-    def _compute_mim(self, E, seed_idcs, target_idcs, con_i):
-        """Compute MIM (a.k.a. GIM if seeds == targets) for one connection."""
-        # Eq. 14
-        self.con_scores[con_i] = (E @ E.transpose(0, 1, 3, 2)).trace(axis1=2, axis2=3).T
-
-        # Eq. 15
-        if len(seed_idcs) == len(target_idcs) and np.all(
-            np.sort(seed_idcs) == np.sort(target_idcs)
-        ):
-            self.con_scores[con_i] *= 0.5
-
-
-class _MICEst(_MultivariateImCohEstBase):
-    """Multivariate imaginary part of coherency (MIC) estimator."""
-
-    name = "MIC"
-
-
-class _MIMEst(_MultivariateImCohEstBase):
-    """Multivariate interaction measure (MIM) estimator."""
-
-    name = "MIM"
-
-
-class _CaCohEst(_MultivariateCohEstBase):
-    """Canonical coherence (CaCoh) estimator.
-
-    See Vidaurre et al. (2019). NeuroImage. DOI:
-    10.1016/j.neuroimage.2019.116009 for equation references.
-    """
-
-    name = "CaCoh"
-    con_scores_dtype = np.complex128  # CaCoh is complex-valued
-
-    def _compute_con_daughter(
-        self, seed_idcs, target_idcs, C, C_bar, U_bar_aa, U_bar_bb, con_i
-    ):
-        """Compute CaCoh & spatial patterns for one connection."""
-        assert self.name == "CaCoh", (
-            "the class name is not recognised, please contact the mne-connectivity "
-            "developers"
-        )
-        n_seeds = len(seed_idcs)
-        n_targets = len(target_idcs)
-
-        rank_seeds = U_bar_aa.shape[3]  # n_seeds after SVD
-        n_components = 1 if self.n_components == 0 else self.n_components
-
-        if n_components > 1:  # don't need if only 1 component being fit
-            # create copy of CSD that will not be deflated
-            C_bar_og = C_bar.copy()
-
-        # get starting basis of space for seeds and targets
-        # (used for CSD deflation if multiple components are being fit)
-        B_a = np.broadcast_to(
-            np.identity(U_bar_aa.shape[3]),
-            [U_bar_aa.shape[dim_i] for dim_i in (0, 1, 3, 3)],
-        )
-        B_b = np.broadcast_to(
-            np.identity(U_bar_bb.shape[3]),
-            [U_bar_bb.shape[dim_i] for dim_i in (0, 1, 3, 3)],
-        )
-
-        # loop over components to fit
-        n_seeds_redux = copy.copy(rank_seeds)  # n_seeds after each component is fit
-        for comp_i in range(n_components):
-            C_bar_ab = C_bar[..., :n_seeds_redux, n_seeds_redux:]
-
-            # Same as Eq. 3 of Ewald et al. (2012)
-            T = self._compute_t(np.real(C_bar), n_seeds=n_seeds_redux)
-            T_aa = T[..., :n_seeds_redux, :n_seeds_redux]  # left term in Eq. 9
-            T_bb = T[..., n_seeds_redux:, n_seeds_redux:]  # right term in Eq. 9
-
-            # optimise phi for given component
-            max_coh, max_phis = self._first_optimise_phi(C_bar_ab, T_aa, T_bb)
-            max_coh, max_phis = self._final_optimise_phi(
-                C_bar_ab, T_aa, T_bb, max_coh, max_phis
-            )
-
-            # Store connectivity scores as complex values
-            if self.store_con:
-                self.con_scores[con_i, comp_i] = (max_coh * np.exp(-1j * max_phis)).T
-
-            # compute final filters and patterns for connectivity maximisation
-            alpha, beta = self._compute_filters_patterns(
-                max_phis,
-                C,
-                C_bar_ab,
-                T_aa,
-                T_bb,
-                U_bar_aa,
-                U_bar_bb,
-                B_a,
-                B_b,
-                n_seeds,
-                n_targets,
-                con_i,
-                comp_i,
-            )  # filters returned in pre-deflation space
-
-            # prepare to fit next largest component
-            if comp_i + 1 < n_components:  # don't do on last component
-                # update filters for already fitted components
-                if comp_i == 0:
-                    W_a = alpha
-                    W_b = beta
-                else:
-                    W_a = np.concatenate((W_a, alpha), axis=3)
-                    W_b = np.concatenate((W_b, beta), axis=3)
-
-                # deflate original CSD to fit next component
-                C_bar, B_a, B_b = self._deflate_csd(C_bar_og, W_a, W_b, rank_seeds)
-                n_seeds_redux -= 1
-
-    def _first_optimise_phi(self, C_ab, T_aa, T_bb):
-        """Find the rough angle, phi, at which coherence is maximised."""
-        n_iters = 5
-
-        # starting phi values to optimise over (in radians)
-        phis = np.linspace(np.pi / n_iters, np.pi, n_iters)
-        phis_coh = np.zeros((n_iters, *C_ab.shape[:2]))
-        for iter_i, iter_phi in enumerate(phis):
-            phi = np.full(C_ab.shape[:2], fill_value=iter_phi)
-            phis_coh[iter_i] = self._compute_cacoh(phi, C_ab, T_aa, T_bb)
-
-        return np.max(phis_coh, axis=0), phis[np.argmax(phis_coh, axis=0)]
-
-    def _final_optimise_phi(self, C_ab, T_aa, T_bb, max_coh, max_phis):
-        """Fine-tune the angle at which coherence is maximised.
-
-        Uses a 2nd order Taylor expansion to approximate change in coherence
-        w.r.t. phi, and determining the next phi to evaluate coherence on (over
-        a total of 10 iterations).
-
-        Depending on how the new phi affects coherence, the step size for the
-        subsequent iteration is adjusted, like that in the Levenberg-Marquardt
-        algorithm.
-
-        Each time-freq. entry of coherence has its own corresponding phi.
-        """
-        n_iters = 10  # sufficient for (close to) exact solution
-        delta_phi = 1e-6
-        mus = np.ones_like(max_phis)  # optimisation step size
-
-        for iter_i in range(n_iters):
-            # 2nd order Taylor expansion around phi
-            coh_plus = self._compute_cacoh(max_phis + delta_phi, C_ab, T_aa, T_bb)
-            coh_minus = self._compute_cacoh(max_phis - delta_phi, C_ab, T_aa, T_bb)
-            f_prime = (coh_plus - coh_minus) / (2 * delta_phi)
-            f_prime_prime = (coh_plus + coh_minus - 2 * max_coh) / (delta_phi**2)
-
-            # determine new phi to test
-            phis = max_phis + (-f_prime / (f_prime_prime - mus))
-            # bound phi in range [-pi, pi]
-            phis = np.mod(phis + np.pi / 2, np.pi) - np.pi / 2
-
-            coh = self._compute_cacoh(phis, C_ab, T_aa, T_bb)
-
-            # find where new phi increases coh & update these values
-            greater_coh = coh > max_coh
-            max_coh[greater_coh] = coh[greater_coh]
-            max_phis[greater_coh] = phis[greater_coh]
-
-            # update step size
-            if iter_i + 1 < n_iters:  # don't bother updating on last cycle
-                mus[greater_coh] /= 2
-                mus[~greater_coh] *= 2
-
-        return max_coh, phis
-
-    def _compute_cacoh(self, phis, C_ab, T_aa, T_bb):
-        """Compute the maximum coherence for a given set of phis."""
-        # from numerator of Eq. 5
-        # for a given CSD entry, projects it onto a span with angle phi, such
-        # that the magnitude of the projected line is captured in the real part
-        C_ab = np.real(np.exp(-1j * np.expand_dims(phis, axis=(2, 3))) * C_ab)
-
-        # Eq. 9; T_aa/bb is sqrt(inv(real(C_aa/bb)))
-        D = T_aa @ (C_ab @ T_bb)
-
-        # Eq. 12
-        a = np.linalg.eigh(D @ D.transpose(0, 1, 3, 2))[1][..., -1]
-        b = np.linalg.eigh(D.transpose(0, 1, 3, 2) @ D)[1][..., -1]
-
-        # Eq. 8
-        numerator = np.einsum("ijk,ijk->ij", a, (D @ np.expand_dims(b, axis=3))[..., 0])
-        denominator = np.sqrt(
-            np.einsum("ijk,ijk->ij", a, a) * np.einsum("ijk,ijk->ij", b, b)
-        )
-
-        return np.abs(numerator / denominator)
-
-    def _compute_filters_patterns(
-        self,
-        phis,
-        C,
-        C_bar_ab,
-        T_aa,
-        T_bb,
-        U_bar_aa,
-        U_bar_bb,
-        B_a,
-        B_b,
-        n_seeds,
-        n_targets,
-        con_i,
-        comp_i,
-    ):
-        """Compute CaCoh spatial filters and patterns for the optimised phi."""
-        C_bar_ab = np.real(np.exp(-1j * np.expand_dims(phis, axis=(2, 3))) * C_bar_ab)
-        D = T_aa @ (C_bar_ab @ T_bb)
-        a = np.linalg.eigh(D @ D.transpose(0, 1, 3, 2))[1][..., -1]
-        b = np.linalg.eigh(D.transpose(0, 1, 3, 2) @ D)[1][..., -1]
-
-        # Eq. 7 rearranged - multiply both sides by sqrt(inv(real(C_aa/bb)))
-        # (project filters back to pre-whitening space)
-        alpha = T_aa @ np.expand_dims(a, axis=3)  # filter for seeds
-        beta = T_bb @ np.expand_dims(b, axis=3)  # filter for targets
-
-        # Project filters back to pre-deflation space (if n_components > 1)
-        alpha = B_a @ alpha
-        beta = B_b @ beta
-
-        # Eqs. 46 & 47 of Ewald et al. (2012)
-        # (project filters back to channel space)
-        alpha_Ubar = U_bar_aa @ alpha
-        beta_Ubar = U_bar_bb @ beta
-
-        # Eq. 14
-        # seed spatial patterns
-        self.patterns[0, con_i, comp_i, :n_seeds] = (
-            np.real(C[..., :n_seeds, :n_seeds]) @ alpha_Ubar
-        )[..., 0].T
-        # target spatial patterns
-        self.patterns[1, con_i, comp_i, :n_targets] = (
-            np.real(C[..., n_seeds:, n_seeds:]) @ beta_Ubar
-        )[..., 0].T
-
-        if self.store_filters:
-            self.filters[0, con_i, comp_i, :n_seeds] = alpha_Ubar[..., 0].T
-            self.filters[1, con_i, comp_i, :n_targets] = beta_Ubar[..., 0].T
-
-        # if multiple components will be fit, need to retain filters in pre-deflation
-        # space without projecting back to channel space (i.e. if CSD dimensionality
-        # reduction has been performed), so are returned here
-        return alpha, beta
-
-    def _deflate_csd(self, C, W_a, W_b, n_seeds):
-        """Deflate CSD by projecting to space orthogonal to fitted filters.
-
-        Removes information about the components that have already been fitted from the
-        CSD, preventing them from interfering with the fitting of subsequent components.
-
-        See "Methods - Extracting further source pairs" of Dähne et al. (2014),
-        NeuroImage, DOI: 10.1016/j.neuroimage.2014.03.075, for an example of applying
-        this approach to timeseries data.
-        """
-        # get orthogonal basis space for filters
-        # (streamlined version of scipy.linalg.null_space() suited for our purposes)
-        B_a = np.linalg.svd(W_a)[0][..., W_a.shape[3] :]
-        B_b = np.linalg.svd(W_b)[0][..., W_b.shape[3] :]
-
-        # apply orthogonal basis to CSD
-        C_redux = np.append(
-            np.append(
-                B_a.transpose(0, 1, 3, 2) @ (C[..., :n_seeds, :n_seeds] @ B_a),  # aa
-                B_a.transpose(0, 1, 3, 2) @ (C[..., :n_seeds, n_seeds:] @ B_b),  # ab
-                axis=3,
-            ),
-            np.append(
-                B_b.transpose(0, 1, 3, 2) @ (C[..., n_seeds:, :n_seeds] @ B_a),  # ba
-                B_b.transpose(0, 1, 3, 2) @ (C[..., n_seeds:, n_seeds:] @ B_b),  # bb
-                axis=3,
-            ),
-            axis=2,
-        )
-
-        return C_redux, B_a, B_b
-
-
-class _GCEstBase(_EpochMeanMultivariateConEstBase):
-    """Base multivariate state-space Granger causality estimator."""
-
-    accumulate_psd = False
-
-    def __init__(self, n_signals, n_cons, n_freqs, n_times, n_lags, *, n_jobs=1):
-        super().__init__(n_signals, n_cons, n_freqs, n_times, n_jobs=n_jobs)
-
-        self.freq_res = (self.n_freqs - 1) * 2
-        if n_lags >= self.freq_res:
+            n_channels = self.data.shape[1]
+        if len(self._get_unique_signals(self.indices)) > n_channels:
             raise ValueError(
-                f"the number of lags {n_lags} must be less than double the frequency "
-                f"resolution {self.freq_res}"
+                'the number of unique signals in indices is greater than the '
+                'number of channels in the data'
             )
-        self.n_lags = n_lags
 
-    def compute_con(self, indices, ranks, n_epochs=1):
-        """Compute multivariate state-space Granger causality."""
-        assert self.name in ["GC", "GC time-reversed"], (
-            "the class name is not recognised, please contact the mne-connectivity "
-            "developers"
-        )
+    def _sort_svd_inputs(self):
+        """Checks that the SVD parameters are appropriate and finds the correct
+        dimensionality reduction settings to use, if applicable.
+        
+        This involves the rank of the data being computed based its non-zero
+        singular values. We use a cut-off of the largest singular value * 1e-5
+        by default to determine when a value is non-zero, as using numpy's
+        default cut-off is too liberal (i.e. low) for our purposes where we need
+        to be stricter.
+        """
+        self.n_components = copy.copy(self.n_components)
 
-        csd = self.reshape_csd() / n_epochs
+        # finds if any SVD has been requested for seeds and/or targets
+        if self.n_components is None:
+            self.n_components = (
+                [None for _ in range(self.n_cons)],
+                [None for _ in range(self.n_cons)]
+            )
+        
+        if self.n_components == 'rank':
+            self.n_components = (
+                ['rank' for _ in range(self.n_cons)],
+                ['rank' for _ in range(self.n_cons)]
+            )
+        
+        if not isinstance(self.n_components, tuple):
+            raise TypeError('n_components must be a tuple')
 
-        n_times = csd.shape[0]
-        times = np.arange(n_times)
-        freqs = np.arange(self.n_freqs)
+        for group_i, group_comps in enumerate(self.n_components):
+            if group_comps is None:
+                group_comps[group_i] = [None for _ in range(self.n_cons)]
+                
+            if not isinstance(group_comps, list):
+                raise TypeError('entries of n_components must be lists')
 
-        con_i = 0
-        for seed_idcs, target_idcs, seed_rank, target_rank in zip(
-            indices[0], indices[1], ranks[0], ranks[1]
+            if len(group_comps) != self.n_cons:
+                raise ValueError(
+                    'entries of n_components must have the same length as '
+                    'specified the number of connections in indices'
+                )
+
+            if not self.perform_svd and any(
+                con_comps is not None for con_comps in group_comps
+            ):
+                self.perform_svd = True
+
+        # if SVD is requested, extract the data and perform subsequent checks
+        if self.perform_svd:
+            if isinstance(self.data, BaseEpochs):
+                epochs = self.data.get_data(picks=self.data.ch_names)
+            else:
+                epochs = self.data
+        
+            for group_idcs, group_comps in zip(self.indices, self.n_components):
+                if any(con_comps is not None for con_comps in group_comps):
+                    index_i = 0
+                    for con_comps, con_chs in zip(group_comps, group_idcs):
+                        if isinstance(con_comps, int):
+                            if con_comps > len(con_chs):
+                                raise ValueError(
+                                    'the number of components to take cannot '
+                                    'be greater than the number of channels in '
+                                    'a given seed/target'
+                                )
+                            if con_comps <= 0:
+                                raise ValueError(
+                                    'the number of components to take must be '
+                                    'greater than 0'
+                                )
+                        elif isinstance(con_comps, str):
+                            if con_comps != 'rank':
+                                raise ValueError(
+                                    'if the number of components is specified '
+                                    'as a string, it must be the string "rank"'
+                                )
+                            # compute the rank of the seeds/targets for a con
+                            S = np.linalg.svd(
+                                epochs[:, con_chs, :],
+                                compute_uv=False
+                            )
+                            group_comps[index_i] = min([np.count_nonzero(
+                                    s >= s[0]*self.rank_nonzero_tol
+                            ) for s in S])
+                        elif con_comps is not None:
+                            raise TypeError(
+                                'n_components must be tuples of lists of '
+                                '`None`, `int`, or the string "rank"'
+                            )
+                        index_i += 1
+
+    def compute_csd_and_connectivity(self):
+        """Compute the CSD of the data and derive connectivity results from
+        it."""
+        # if SVD is requested or the specified fbands are discontinuous, the
+        # CSD (and hence connectivity) has to be computed separately for any GC
+        # methods
+        if self.present_gc_methods and self.compute_gc_separately:
+            self._compute_separate_gc_csd_and_connectivity()
+
+        # if GC has been computed separately, the coherence methods are computed
+        # here, otherwise both GC and coherence methods are computed here
+        if self.remaining_method_types:
+            self._compute_remaining_csd_and_connectivity()
+
+        # combine all connectivity results (if GC was computed seperately)
+        self._collate_connectivity_results()
+    
+    def _compute_separate_gc_csd_and_connectivity(self):
+        """Computes the CSD and connectivity for GC methods separately from
+        other methods if SVD is being performed, or the requested fbands are
+        discontinuous.
+        
+        If SVD is being performed with GC, this has to be done on the
+        timeseries data for each connection separately, and so this transformed
+        data cannot be used to compute the CSD for coherence-based connectivity
+        methods.
+
+        Unlike the coherence methods, the state-space GC methods used here rely
+        on cross-frequency relationships, so discontinuous frequencies will mess
+        up the results. Hence, GC must be computed on a continuous set of
+        frequencies, and then have the requested frequency band results taken.
+        """
+        # finds the GC methods to compute
+        self.separate_gc_method_types = [
+            mtype for mtype in self.con_method_types if mtype.name in
+            self.gc_method_names
+        ]
+
+        seed_target_data, n_seeds = self._seeds_targets_svd()
+
+        # computes GC for each connection separately (no topographies for GC)
+        n_gc_methods = len(self.present_gc_methods)
+        self.separate_gc_con = [[] for _ in range(n_gc_methods)]
+        self.separate_gc_topo = [None for _ in range(n_gc_methods)]
+
+        for con_data, n_seed_comps in zip(seed_target_data, n_seeds):
+            new_indices = (
+                [np.arange(n_seed_comps).tolist()],
+                [np.arange(n_seed_comps, con_data.shape[1]).tolist()]
+            )
+
+            con_methods = self._compute_csd(
+                con_data, self.separate_gc_method_types, new_indices
+            )
+
+            this_con, _, = self._compute_connectivity(con_methods, new_indices)
+
+            for method_i in range(n_gc_methods):
+                self.separate_gc_con[method_i].extend(this_con[method_i])
+
+        # finds the methods still needing to be computed
+        self.remaining_method_types = [
+            mtype for mtype in self.con_method_types if
+            mtype not in self.separate_gc_method_types
+        ]
+
+    def _seeds_targets_svd(self):
+        """SVDs the epoched data separately for the seeds and targets of each
+        connection according to the specified number of seed and target
+        components. If the number of components for a given instance is `None`,
+        the original data is returned."""
+        if isinstance(self.data, BaseEpochs):
+            epochs = self.data.get_data(picks=self.data.ch_names).copy()
+        else:
+            epochs = self.data.copy()
+
+        seed_target_data = []
+        n_seeds = []
+        for seeds, targets, n_seed_comps, n_target_comps in zip(
+            self.indices[0], self.indices[1], self.n_components[0],
+            self.n_components[1]
         ):
-            self._log_connection_number(con_i)
+            if n_seed_comps is not None: # SVD seed data
+                seed_data = self._epochs_svd(epochs[:, seeds, :], n_seed_comps)
+            else: # use unaltered seed data
+                seed_data = epochs[:, seeds, :]
+            n_seeds.append(seed_data.shape[1])
 
-            seed_idcs = seed_idcs.compressed()
-            target_idcs = target_idcs.compressed()
-            con_idcs = [*seed_idcs, *target_idcs]
+            if n_target_comps is not None: # SVD target data
+                target_data = self._epochs_svd(
+                    epochs[:, targets, :], n_target_comps
+                )
+            else: # use unaltered target data
+                target_data = epochs[:, targets, :]
 
-            C = csd[np.ix_(times, freqs, con_idcs, con_idcs)]
+            seed_target_data.append(np.append(seed_data, target_data, axis=1))
 
-            C_bar = self._csd_svd(C, seed_idcs, seed_rank, target_rank)
-            n_signals = seed_rank + target_rank
-            con_seeds = np.arange(seed_rank)
-            con_targets = np.arange(target_rank) + seed_rank
+        return seed_target_data, n_seeds
 
-            autocov = self._compute_autocov(C_bar)
-            if self.name == "GC time-reversed":
-                autocov = autocov.transpose(0, 1, 3, 2)
+    def _epochs_svd(self, epochs, n_comps):
+        """Performs an SVD on epoched data and selects the first k components
+        for dimensionality reduction before reconstructing the data with
+        (U_k @ S_k @ V_k)."""
+        # mean-centre the data epoch-wise
+        centred_epochs = np.array([epoch - epoch.mean() for epoch in epochs])
 
-            A_f, V = self._autocov_to_full_var(autocov)
-            A_f_3d = np.reshape(
-                A_f, (n_times, n_signals, n_signals * self.n_lags), order="F"
+        # compute the SVD (transposition so that the channels are the columns of
+        # each epoch)
+        U, S, V = np.linalg.svd(
+            centred_epochs.transpose(0, 2, 1), full_matrices=False
+        )
+
+        # take the first k components
+        U_k = U[:, :, :n_comps]
+        S_k = np.eye(n_comps) * S[:, np.newaxis][:, :n_comps, :n_comps]
+        V_k = V[:, :n_comps, :n_comps]
+
+        # reconstruct the dimensionality-reduced data (have to transpose the
+        # data back into [epochs x channels x timepoints])
+        return (U_k @ (S_k @ V_k)).transpose(0, 2, 1)
+
+    def _compute_remaining_csd_and_connectivity(self):
+        """Computes connectivity where a single CSD can be computed and the
+        connectivity computations performed for all connections together (i.e.
+        anything other than GC with SVD and/or GC with discontinuous
+        frequencies)."""
+        con_methods = self._compute_csd(
+            self.data, self.remaining_method_types, self.indices
+        )
+
+        self.remaining_con, self.remaining_topo = (
+            self._compute_connectivity(con_methods, self.remapped_indices)
+        )
+
+    def _compute_csd(self, data, con_method_types, indices):
+        """Computes the cross-spectral density of the data in preparation for
+        the multivariate connectivity computations."""
+        logger.info('Connectivity computation...')
+
+        con_methods = self._prepare_csd_computation(
+            data, con_method_types, indices
+        )
+
+        # performs the CSD computation for each epoch block
+        logger.info('Computing cross-spectral density from epochs')
+        self.n_epochs = 0
+        for epoch_block in ProgressBar(
+            self.epoch_blocks, mesg='CSD epoch blocks'
+        ):
+            # check dimensions and time scale
+            for this_epoch in epoch_block:
+                _, _, _, self.warn_times = _get_and_verify_data_sizes(
+                    this_epoch, self.sfreq, self.n_signals, self.n_times_in,
+                    self.times_in, warn_times=self.warn_times
+                )
+                self.n_epochs += 1
+
+            # compute CSD of epochs
+            epochs = self.parallel(
+                self._epoch_spectral_connectivity(
+                    data=this_epoch, **self.csd_call_params
+                )
+                for this_epoch in epoch_block
             )
-            A, K = self._full_var_to_iss(A_f_3d)
 
-            self.con_scores[con_i] = self._iss_to_ugc(
-                A, A_f_3d, K, V, con_seeds, con_targets
+            # unpack and accumulate CSDs of epochs in connectivity methods
+            for epoch in epochs:
+                for method, epoch_csd in zip(con_methods, epoch[0]):
+                    method.combine(epoch_csd)
+        
+        return con_methods
+
+    def _prepare_csd_computation(self, data, con_method_types, indices):
+        """Collects and returns information in preparation for computing the
+        cross-spectral density."""
+        self.epoch_blocks = [
+            epoch for epoch in _get_n_epochs(data, self.n_jobs)
+        ]
+
+        fmin, fmax = self._get_fmin_fmax_for_csd(con_method_types)
+        (
+            _, self.times, n_times, self.times_in, self.n_times_in, tmin_idx,
+            tmax_idx, self.n_freqs, freq_mask, self.freqs, freqs_bands,
+            freq_idx_bands, self.n_signals, _, self.warn_times
+        ) = _prepare_connectivity(
+            epoch_block=self.epoch_blocks[0], times_in=self.times_in,
+            tmin=self.tmin, tmax=self.tmax, fmin=fmin, fmax=fmax,
+            sfreq=self.sfreq, indices=indices, mode=self.mode,
+            fskip=self.fskip, n_bands=self.n_bands, cwt_freqs=self.cwt_freqs,
+            faverage=self.faverage
+        )
+        self._store_freq_band_info(
+            con_method_types, freqs_bands, freq_idx_bands
+        )
+
+        spectral_params, mt_adaptive, self.n_times_spectrum, self.n_tapers = (
+            _assemble_spectral_params(
+                mode=self.mode, n_times=n_times, mt_adaptive=self.mt_adaptive,
+                mt_bandwidth=self.mt_bandwidth, sfreq=self.sfreq,
+                mt_low_bias=self.mt_low_bias, cwt_n_cycles=self.cwt_n_cycles,
+                cwt_freqs=self.cwt_freqs, freqs=self.freqs, freq_mask=freq_mask
+            )
+        )
+
+        self._sort_con_indices(indices)
+
+        con_methods = self._instantiate_con_estimators(con_method_types, indices)
+
+        self.csd_call_params = dict(
+            sig_idx=self.sig_idx, tmin_idx=tmin_idx, tmax_idx=tmax_idx,
+            sfreq=self.sfreq, mode=self.mode, freq_mask=freq_mask,
+            idx_map=self.idx_map, block_size=self.block_size, psd=None,
+            accumulate_psd=False, mt_adaptive=mt_adaptive,
+            con_method_types=self.con_method_types, con_methods=None,
+            n_signals=self.n_signals, use_n_signals=self.use_n_signals,
+            n_times=n_times, gc_n_lags=self.gc_n_lags, accumulate_inplace=False
+        )
+        self.csd_call_params.update(**spectral_params)
+
+        return con_methods
+
+    def _get_fmin_fmax_for_csd(self, con_method_types):
+        """Gets fmin and fmax args to use for the CSD computation."""
+        if (
+            self.present_gc_methods and self.discontinuous_freqs and
+            con_method_types[0] in self.separate_gc_method_types
+        ):
+            # compute GC on a continuous set of freqs spanning all bands of
+            # interest due to the cross-freq relationship of the GC methods
+            return (
+                np.array((np.min(self.fmin), )),
+                np.array((np.max(self.fmax), ))
             )
 
-            con_i += 1
+        # use existing fmin and fmax if GC is not being computed, or if GC is
+        # being computed and the requested freq bands are not discontinuous
+        return (self.fmin, self.fmax)
 
-        self.reshape_results()
-
-    def _csd_svd(self, csd, seed_idcs, seed_rank, target_rank):
-        """Dimensionality reduction of CSD with SVD on the covariance."""
-        # sum over times and epochs to get cov. from CSD
-        cov = csd.sum(axis=(0, 1))
-
-        n_seeds = len(seed_idcs)
-        n_targets = csd.shape[3] - n_seeds
-
-        cov_aa = cov[:n_seeds, :n_seeds]
-        cov_bb = cov[n_seeds:, n_seeds:]
-
-        if seed_rank != n_seeds:
-            U_aa = np.linalg.svd(np.real(cov_aa), full_matrices=False)[0]
-            U_bar_aa = U_aa[:, :seed_rank]
+    def _store_freq_band_info(
+        self, con_method_types, freqs_bands, freq_idx_bands
+    ):
+        """Ensures the frequency band information returned from the connectivity
+        preparation function is correct before storing them in the object."""
+        if (
+            self.present_gc_methods and self.discontinuous_freqs and
+            con_method_types[0] in self.separate_gc_method_types
+        ):
+            # compute fbands and indices as the freqs appear in fmin and fmax;
+            # required as the fmin and fmax args to the connectivity preparation
+            # function differ to those provided by the end user
+            self.freq_idx_bands = [
+                np.where((self.freqs >= fl) & (self.freqs <= fu))[0] for
+                fl, fu in zip(self.fmin, self.fmax)
+            ]
+            self.freqs_bands = [
+                self.freqs[freq_idx] for freq_idx in self.freq_idx_bands
+            ]
         else:
-            U_bar_aa = np.identity(n_seeds)
+            # use the fband arguments returned from the connectivity preparation
+            # function, matching the fband args provided by the end user
+            self.freq_idx_bands = freq_idx_bands
+            self.freqs_bands = freqs_bands
 
-        if target_rank != n_targets:
-            U_bb = np.linalg.svd(np.real(cov_bb), full_matrices=False)[0]
-            U_bar_bb = U_bb[:, :target_rank]
+    def _sort_con_indices(self, indices):
+        """Maps indices to the unique indices, finds the signals for which the
+        CSD needs to be computed (and how many used signals there are), and gets
+        the seed-target indices for the CSD."""
+        # map indices to unique indices
+        unique_indices = np.unique(np.concatenate(sum(indices, [])))
+        remapping = {ch_i: sig_i for sig_i, ch_i in enumerate(unique_indices)}
+        self.remapped_indices = tuple([
+            [[remapping[idx] for idx in idcs] for idcs in indices_group]
+            for indices_group in indices
+        ])
+
+        # unique signals for which we actually need to compute CSD
+        self.sig_idx = self._get_unique_signals(self.remapped_indices)
+        self.use_n_signals = len(self.sig_idx)
+
+        # gets seed-target indices for CSD
+        self.idx_map = [
+            np.repeat(
+                self.sig_idx, len(self.sig_idx)),
+                np.tile(self.sig_idx, len(self.sig_idx)
+            )
+        ]
+
+    def _get_unique_signals(self, indices):
+        """Find the unique signals in a set of indices."""
+        return np.unique(sum(sum(indices, []), []))
+
+    def _instantiate_con_estimators(self, con_method_types, indices):
+        """Create instances of the connectivity estimators and log the methods
+        being computed."""
+        con_methods = []
+        for mtype in con_method_types:
+            if "n_lags" in list(inspect.signature(mtype).parameters):
+                # if a GC method, provide n_lags argument
+                con_methods.append(
+                    mtype(
+                        self.use_n_signals, len(indices[0]), self.n_freqs,
+                        self.n_times_spectrum, self.gc_n_lags, self.n_jobs
+                    )
+                )
+            else:
+                # if a coherence method, do not provide n_lags argument
+                con_methods.append(
+                    mtype(
+                        self.use_n_signals, len(indices[0]), self.n_freqs,
+                        self.n_times_spectrum, self.n_jobs
+                    )
+                )
+        
+        return con_methods
+
+    def _compute_connectivity(self, con_methods, indices):
+        """Computes the multivariate connectivity results."""
+        con = [None for _ in range(len(con_methods))]
+        topo = [None for _ in range(len(con_methods))]
+
+        # add the GC results to con in the correct positions according to the
+        # order of con_methods
+        con = self._compute_gc_connectivity(con_methods, con, indices)
+
+        # add the coherence results to con in the correct positions according to
+        # the order of con_methods
+        con, topo = self._compute_coh_connectivity(
+            con_methods, con, topo, indices
+        )
+
+        method_i = 0
+        for method_con, method_topo in zip(con, topo):
+            assert method_con is not None, (
+                'A connectivity result has been missed. Please contact the '
+                'mne-connectivity developers.'
+            )
+
+            self._check_correct_results_dimensions(
+                con_methods, method_con, method_topo, indices
+            )
+
+            if self.faverage:
+                con[method_i], topo[method_i] = self._compute_faverage(
+                        con=method_con, topo=method_topo
+                    )
+            
+            method_i += 1
+
+        self.freqs_used = self.freqs
+        if self.faverage:
+            # for each band we return the frequencies that were averaged
+            self.freqs = [np.mean(band) for band in self.freqs_bands]
+            # return max and min frequencies that were averaged for each band
+            self.freqs_used = [
+                [np.min(band), np.max(band)] for band in self.freqs_bands
+            ]
+
+        # number of nodes in the original data
+        self.n_nodes = self.n_signals
+
+        return con, topo
+
+    def _compute_gc_connectivity(self, con_methods, con, indices):
+        """Computes GC connectivity.
+        
+        Different GC methods can rely on common information, so rather than
+        re-computing this information everytime a different GC method is called,
+        store this information such that it can be accessed to compute the final
+        GC connectivity scores when needed.
+        """
+        self._get_gc_forms_to_compute(con_methods)
+
+        if self.compute_gc_forms:
+            self._compute_and_set_gc_autocov()
+
+            gc_scores = {}
+            for form_name, form_info in self.compute_gc_forms.items():
+                # computes connectivity for individual GC forms
+                form_info['method_class'].compute_con(
+                    indices[0], indices[1], form_info['flip_seeds_targets'], 
+                    form_info['reverse_time'], form_name
+                )
+
+                # assigns connectivity score to their appropriate GC forms for
+                # combining into the final GC method results
+                gc_scores[form_name] = form_info['method_class'].con_scores
+            
+            con = self._combine_gc_forms(con_methods, con, gc_scores)
+        
+            # remove the results for frequencies not requested by the end user
+            if self.discontinuous_freqs:
+                con = self._make_gc_freqs_discontinuous(con)
+            
+            # set n_signals to equal the number in the non-SVD data
+            if self.perform_svd:
+                self.n_signals = len(self._get_unique_signals(self.indices))
+
+        return con
+
+    def _get_gc_forms_to_compute(self, con_methods):
+        """Finds the GC forms that need to be computed."""
+        self.compute_gc_forms = {}
+        for form_name, form_info in self.possible_gc_forms.items():
+            for method in con_methods:
+                if (
+                    method.name in form_info['for_methods'] and
+                    form_name not in self.compute_gc_forms.keys()
+                ):
+                    form_info.update(method_class=copy.deepcopy(method))
+                    self.compute_gc_forms[form_name] = form_info
+
+    def _compute_and_set_gc_autocov(self):
+        """Computes autocovariance once and assigns it to all GC methods."""
+        first_form = True
+        for form_info in self.compute_gc_forms.values():
+            if first_form:
+                form_info['method_class'].compute_autocov(self.n_epochs)
+                autocov = form_info['method_class'].autocov.copy()
+                first_form = False
+            else:
+                form_info['method_class'].autocov = autocov
+
+    def _combine_gc_forms(self, con_methods, con, gc_scores):
+        """Combines the information from all the different GC forms so that the
+        final connectivity scores for the requested GC methods are returned."""
+        for method_i, method in enumerate(con_methods):
+            if method.name == 'GC':
+                con[method_i] = gc_scores['seeds -> targets']
+            elif method.name == 'Net GC':
+                con[method_i] = (
+                    gc_scores['seeds -> targets'] -
+                    gc_scores['targets -> seeds']
+                )
+            elif method.name == 'TRGC':
+                con[method_i] = (
+                    gc_scores['seeds -> targets'] -
+                    gc_scores['time-reversed[seeds -> targets]']
+                )
+            elif method.name == 'Net TRGC':
+                con[method_i] = (
+                    (
+                        gc_scores['seeds -> targets'] -
+                        gc_scores['targets -> seeds']
+                    ) - (
+                        gc_scores['time-reversed[seeds -> targets]'] -
+                        gc_scores['time-reversed[targets -> seeds]']
+                    )
+                )
+
+        return con
+
+    def _make_gc_freqs_discontinuous(self, con):
+        """Remove the unrequested frequencies from the GC results so that the
+        results match the frequency bands requested by the end user."""
+        # find which freqs in the results are needed
+        requested_freqs = np.concatenate(self.freq_idx_bands)
+        freq_mask = [freq in requested_freqs for freq in range(self.n_freqs)]
+        
+        # exclude the unwanted freqs from the results
+        for method_i, method_con in enumerate(con):
+            con[method_i] = method_con[:, freq_mask]
+        
+        # set the frequency attrs to the correct, discontinuous values
+        self.n_freqs = len(requested_freqs)
+        self.freqs = self.freqs[freq_mask]
+
+        freq_idx_bands = []
+        freq_idx = 0
+        for band in self.freq_idx_bands:
+            freq_idx_bands.append(
+                np.arange(freq_idx, freq_idx + len(band), dtype=band.dtype)
+            )
+            freq_idx += len(band)
+        self.freq_idx_bands = freq_idx_bands
+
+        return con
+
+    def _compute_coh_connectivity(self, con_methods, con, topo, indices):
+        """Computes MIC and MIM connectivity.
+        
+        MIC and MIM rely on common information, so rather than re-computing this
+        information everytime a different coherence method is called, store this
+        information such that it can be accessed to compute the final MIC and
+        MIM connectivity scores when needed.
+        """
+        self._get_coh_form_to_compute(con_methods)
+
+        if self.compute_coh_form:
+            # compute connectivity for MIC and/or MIM in a single instance
+            form_name = list(self.compute_coh_form.keys())[0]  # only one there
+            form_info = self.compute_coh_form[form_name]
+            form_info['method_class'].compute_con(
+                indices[0], indices[1], self.n_components, self.n_epochs,
+                form_name
+            )
+        
+            # store the MIC and/or MIM results in the right places
+            for method_i, method in enumerate(con_methods):
+                if method.name == "MIC":
+                    con[method_i] = form_info['method_class'].mic_scores
+                    topo[method_i] = form_info['method_class'].topographies
+                elif method.name == "MIM":
+                    con[method_i] = form_info['method_class'].mim_scores
+
+        return con, topo
+
+    def _get_coh_form_to_compute(self, con_methods):
+        """Finds the coherence form that need to be computed."""
+        method_names = [method.name for method in con_methods]
+        self.compute_coh_form = {}
+        for form_name, form_info in self.possible_coh_forms.items():
+            if (
+                all(name in method_names for name in form_info['for_methods'])
+                and not any(
+                    name in method_names for name in
+                    form_info['exclude_methods']
+                )
+            ):
+                coh_class = con_methods[
+                    method_names.index(form_info['for_methods'][0])
+                ]
+                form_info.update(method_class=coh_class)
+                self.compute_coh_form[form_name] = form_info
+                break # only one form is possible at any one instance
+
+    def _check_correct_results_dimensions(self, con_methods, con, topo, indices):
+        """Checks that the results of the connectivity computations have the
+        appropriate dimensions."""
+        n_cons = len(indices[0])
+        n_times = con_methods[0].n_times
+
+        assert (con.shape[0] == n_cons), (
+            'The first dimension of connectivity scores does not match the '
+            'number of connections. Please contact the mne-connectivity ' 
+            'developers.'
+        )
+
+        assert (con.shape[1] == self.n_freqs), (
+            'The second dimension of connectivity scores does not match the '
+            'number of frequencies. Please contact the mne-connectivity ' 
+            'developers.'
+        )
+
+        if n_times != 0:
+            assert (con.shape[2] == n_times), (
+                'The third dimension of connectivity scores does not match '
+                'the number of timepoints. Please contact the mne-connectivity ' 
+                'developers.'
+            )
+        
+        if topo is not None:
+            assert (topo[0].shape[0] == n_cons and topo[1].shape[0]), (
+                'The first dimension of topographies does not match the number '
+                'of connections. Please contact the mne-connectivity '
+                'developers.'
+            )
+
+            for con_i in range(n_cons):
+                assert (
+                    topo[0][con_i].shape[1] == self.n_freqs and
+                    topo[1][con_i].shape[1] == self.n_freqs
+                ), (
+                    'The second dimension of topographies does not match the '
+                    'number of frequencies. Please contact the '
+                    'mne-connectivity developers.'
+                )
+
+                if n_times != 0:
+                    assert (
+                        topo[0][con_i].shape[2] == n_times and
+                        topo[1][con_i].shape[2] == n_times
+                    ), (
+                        'The third dimension of topographies does not match '
+                        'the number of timepoints. Please contact the '
+                        'mne-connectivity developers.'
+                    )
+
+    def _compute_faverage(self, con, topo):
+        """Computes the average connectivity across the frequency bands."""
+        n_cons = con.shape[0]
+        con_shape = (n_cons, self.n_bands) + con.shape[2:]
+        con_bands = np.empty(con_shape, dtype=con.dtype)
+        for band_idx in range(self.n_bands):
+            con_bands[:, band_idx] = np.mean(
+                con[:, self.freq_idx_bands[band_idx]], axis=1
+            )
+
+        if topo is not None:
+            topo_bands = np.empty((2, n_cons), dtype=topo.dtype)
+            for group_i in range(2):
+                for con_i in range(n_cons):
+                    band_topo = [
+                        np.mean(topo[group_i][con_i][:, freq_idx_band], axis=1)
+                        for freq_idx_band in self.freq_idx_bands
+                    ]
+                    topo_bands[group_i][con_i] = np.array(band_topo).T
         else:
-            U_bar_bb = np.identity(n_targets)
+            topo_bands = None
+        
+        return con_bands, topo_bands
 
-        C_aa = csd[..., :n_seeds, :n_seeds]
-        C_ab = csd[..., :n_seeds, n_seeds:]
-        C_bb = csd[..., n_seeds:, n_seeds:]
-        C_ba = csd[..., n_seeds:, :n_seeds]
+    def _collate_connectivity_results(self):
+        """Collects the connectivity results for non-GC with SVD analysis and GC
+        with SVD together according to the order in which the respective methods
+        were called."""
+        self.con = [*self.remaining_con, *self.separate_gc_con]
+        self.topo = [*self.remaining_topo, *self.separate_gc_topo]
 
-        C_bar_aa = U_bar_aa.transpose(1, 0) @ (C_aa @ U_bar_aa)
-        C_bar_ab = U_bar_aa.transpose(1, 0) @ (C_ab @ U_bar_bb)
-        C_bar_bb = U_bar_bb.transpose(1, 0) @ (C_bb @ U_bar_bb)
-        C_bar_ba = U_bar_bb.transpose(1, 0) @ (C_ba @ U_bar_aa)
-        C_bar = np.append(
-            np.append(C_bar_aa, C_bar_ab, axis=3),
-            np.append(C_bar_ba, C_bar_bb, axis=3),
-            axis=2,
-        )
+        if self.remaining_con and self.separate_gc_con:
+            # orders the results according to the order they were called
+            methods_order = [
+                *[mtype.name for mtype in self.remaining_method_types],
+                *[mtype.name for mtype in self.separate_gc_method_types]
+            ]
+            self.con = [
+                self.con[methods_order.index(mtype.name)] for mtype in
+                self.con_method_types
+            ]
+            self.topo = [
+                self.topo[methods_order.index(mtype.name)] for mtype in
+                self.con_method_types
+            ]
 
-        return C_bar
+        # else if only separate GC connectivity, results already in order in
+        # which they were called
+        # else you only have the remaining (non-GC with SVD/discontinuous
+        # frequency) results, already in the order in which they were called
 
-    def _compute_autocov(self, csd):
-        """Compute autocovariance from the CSD."""
-        n_times = csd.shape[0]
-        n_signals = csd.shape[2]
+        self.con = np.array(self.con)
+        self.topo = np.array(self.topo, dtype=object)
 
-        circular_shifted_csd = np.concatenate(
-            [np.flip(np.conj(csd[:, 1:]), axis=1), csd[:, :-1]], axis=1
-        )
-        ifft_shifted_csd = self._block_ifft(circular_shifted_csd, self.freq_res)
-        lags_ifft_shifted_csd = np.reshape(
-            ifft_shifted_csd[:, : self.n_lags + 1],
-            (n_times, self.n_lags + 1, n_signals**2),
-            order="F",
-        )
-
-        signs = np.repeat([1], self.n_lags + 1).tolist()
-        signs[1::2] = [x * -1 for x in signs[1::2]]
-        sign_matrix = np.repeat(
-            np.tile(np.array(signs), (n_signals**2, 1))[np.newaxis], n_times, axis=0
-        ).transpose(0, 2, 1)
-
-        return np.real(
-            np.reshape(
-                sign_matrix * lags_ifft_shifted_csd,
-                (n_times, self.n_lags + 1, n_signals, n_signals),
-                order="F",
+    def store_connectivity_results(self):
+        """Stores multivariate connectivity results in mne-connectivity
+        objects."""
+        # create a list of connectivity containers
+        self.connectivity = []
+        for _con, _topo, _method in zip(self.con, self.topo, self.method):
+            kwargs = dict(
+                data=_con, topographies=_topo, names=self.names,
+                freqs=self.freqs, method=_method, n_nodes=self.n_nodes,
+                spec_method=self.mode, indices=self.indices,
+                n_components=self.n_components, n_epochs_used=self.n_epochs,
+                freqs_used=self.freqs_used, times_used=self.times,
+                n_tapers=self.n_tapers, n_lags=None, metadata=self.metadata,
+                events=self.events, event_id=self.event_id
             )
-        )
+            if _method in ['gc', 'net_gc', 'trgc', 'net_trgc']:
+                kwargs.update(n_lags=self.gc_n_lags)
+            # create the connectivity container
+            if self.mode in ['multitaper', 'fourier']:
+                conn_class = MultivariateSpectralConnectivity
+            else:
+                assert self.mode == 'cwt_morlet'
+                conn_class = MultivariateSpectroTemporalConnectivity
+                kwargs.update(times=self.times)
+            self.connectivity.append(conn_class(**kwargs))
 
-    def _block_ifft(self, csd, n_points):
-        """Compute block iFFT with n points."""
-        shape = csd.shape
-        csd_3d = np.reshape(csd, (shape[0], shape[1], shape[2] * shape[3]), order="F")
+        logger.info('[Connectivity computation done]')
 
-        csd_ifft = np.fft.ifft(csd_3d, n=n_points, axis=1)
-
-        return np.reshape(csd_ifft, shape, order="F")
-
-    def _autocov_to_full_var(self, autocov):
-        """Compute full VAR model using Whittle's LWR recursion."""
-        if np.any(np.linalg.det(autocov) == 0):
-            raise RuntimeError(
-                "the autocovariance matrix is singular; check if your data is rank "
-                "deficient and specify an appropriate rank argument <= the rank of the "
-                "seeds and targets"
-            )
-
-        A_f, V = self._whittle_lwr_recursion(autocov)
-
-        if not np.isfinite(A_f).all():
-            raise RuntimeError(
-                "at least one VAR model coefficient is infinite or NaN; check the data "
-                "you are using"
-            )
-
-        try:
-            np.linalg.cholesky(V)
-        except np.linalg.LinAlgError as np_error:
-            raise RuntimeError(
-                "the covariance matrix of the residuals is not positive-definite; "
-                "check the singular values of your data and specify an appropriate "
-                "rank argument <= the rank of the seeds and targets"
-            ) from np_error
-
-        return A_f, V
-
-    def _whittle_lwr_recursion(self, G):
-        """Solve Yule-Walker eqs. for full VAR params. with LWR recursion.
-
-        See: Whittle P., 1963. Biometrika, DOI: 10.1093/biomet/50.1-2.129
-        """
-        # Initialise recursion
-        n = G.shape[2]  # number of signals
-        q = G.shape[1] - 1  # number of lags
-        t = G.shape[0]  # number of times
-        qn = n * q
-
-        cov = G[:, 0, :, :]  # covariance
-        G_f = np.reshape(
-            G[:, 1:, :, :].transpose(0, 3, 1, 2), (t, qn, n), order="F"
-        )  # forward autocov
-        G_b = np.reshape(
-            np.flip(G[:, 1:, :, :], 1).transpose(0, 3, 2, 1), (t, n, qn), order="F"
-        ).transpose(0, 2, 1)  # backward autocov
-
-        A_f = np.zeros((t, n, qn))  # forward coefficients
-        A_b = np.zeros((t, n, qn))  # backward coefficients
-
-        k = 1  # model order
-        r = q - k
-        k_f = np.arange(k * n)  # forward indices
-        k_b = np.arange(r * n, qn)  # backward indices
-
-        try:
-            A_f[:, :, k_f] = np.linalg.solve(
-                cov, G_b[:, k_b, :].transpose(0, 2, 1)
-            ).transpose(0, 2, 1)
-            A_b[:, :, k_b] = np.linalg.solve(
-                cov, G_f[:, k_f, :].transpose(0, 2, 1)
-            ).transpose(0, 2, 1)
-
-            # Perform recursion
-            for k in np.arange(2, q + 1):
-                var_A = G_b[:, (r - 1) * n : r * n, :] - (
-                    A_f[:, :, k_f] @ G_b[:, k_b, :]
-                )
-                var_B = cov - (A_b[:, :, k_b] @ G_b[:, k_b, :])
-                AA_f = np.linalg.solve(var_B, var_A.transpose(0, 2, 1)).transpose(
-                    0, 2, 1
-                )
-
-                var_A = G_f[:, (k - 1) * n : k * n, :] - (
-                    A_b[:, :, k_b] @ G_f[:, k_f, :]
-                )
-                var_B = cov - (A_f[:, :, k_f] @ G_f[:, k_f, :])
-                AA_b = np.linalg.solve(var_B, var_A.transpose(0, 2, 1)).transpose(
-                    0, 2, 1
-                )
-
-                A_f_previous = A_f[:, :, k_f]
-                A_b_previous = A_b[:, :, k_b]
-
-                r = q - k
-                k_f = np.arange(k * n)
-                k_b = np.arange(r * n, qn)
-
-                A_f[:, :, k_f] = np.dstack((A_f_previous - (AA_f @ A_b_previous), AA_f))
-                A_b[:, :, k_b] = np.dstack((AA_b, A_b_previous - (AA_b @ A_f_previous)))
-        except np.linalg.LinAlgError as np_error:
-            raise RuntimeError(
-                "the autocovariance matrix is singular; check if your data is rank "
-                "deficient and specify an appropriate rank argument <= the rank of the "
-                "seeds and targets"
-            ) from np_error
-
-        V = cov - (A_f @ G_f)
-        A_f = np.reshape(A_f, (t, n, n, q), order="F")
-
-        return A_f, V
-
-    def _full_var_to_iss(self, A_f):
-        """Compute innovations-form parameters for a state-space model.
-
-        Parameters computed from a full VAR model using Aoki's method. For a
-        non-moving-average full VAR model, the state-space parameter C
-        (observation matrix) is identical to AF of the VAR model.
-
-        See: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        t = A_f.shape[0]
-        m = A_f.shape[1]  # number of signals
-        p = A_f.shape[2] // m  # number of autoregressive lags
-
-        I_p = np.dstack(t * [np.eye(m * p)]).transpose(2, 0, 1)
-        A = np.hstack((A_f, I_p[:, : (m * p - m), :]))  # state transition matrix
-        K = np.hstack(
-            (
-                np.dstack(t * [np.eye(m)]).transpose(2, 0, 1),
-                np.zeros((t, (m * (p - 1)), m)),
-            )
-        )  # Kalman gain matrix
-
-        return A, K
-
-    def _iss_to_ugc(self, A, C, K, V, seeds, targets):
-        """Compute unconditional GC from innovations-form state-space params.
-
-        See: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        times = np.arange(A.shape[0])
-        freqs = np.arange(self.n_freqs)
-
-        # points on a unit circle in the complex plane, one for each frequency
-        z = np.exp(-1j * np.pi * np.linspace(0, 1, self.n_freqs))
-
-        H = self._iss_to_tf(A, C, K, z)  # spectral transfer function
-        V_22_1 = np.linalg.cholesky(self._partial_covar(V, seeds, targets))
-        HV = H @ np.linalg.cholesky(V)
-        S = HV @ HV.conj().transpose(0, 1, 3, 2)  # Eq. 6
-        S_11 = S[np.ix_(freqs, times, targets, targets)]
-        HV_12 = H[np.ix_(freqs, times, targets, seeds)] @ V_22_1
-        HVH = HV_12 @ HV_12.conj().transpose(0, 1, 3, 2)
-
-        # Eq. 11
-        return np.real(np.log(np.linalg.det(S_11)) - np.log(np.linalg.det(S_11 - HVH)))
-
-    def _iss_to_tf(self, A, C, K, z):
-        """Compute transfer function for innovations-form state-space params.
-
-        In the frequency domain, the back-shift operator, z, is a vector of
-        points on a unit circle in the complex plane. z = e^-iw, where -pi < w
-        <= pi.
-
-        A note on efficiency: solving over the 4D time-freq. tensor is slower
-        than looping over times and freqs when n_times and n_freqs high, and
-        when n_times and n_freqs low, looping over times and freqs very fast
-        anyway (plus tensor solving doesn't allow for parallelisation).
-
-        See: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        t = A.shape[0]
-        h = self.n_freqs
-        n = C.shape[1]
-        m = A.shape[1]
-        I_n = np.eye(n)
-        I_m = np.eye(m)
-        H = np.zeros((h, t, n, n), dtype=np.complex128)
-
-        parallel, parallel_compute_H, _ = parallel_func(
-            _gc_compute_H, self.n_jobs, verbose=False
-        )
-        H = np.zeros((h, t, n, n), dtype=np.complex128)
-        for block_i in ProgressBar(range(self.n_steps), mesg="frequency blocks"):
-            freqs = self._get_block_indices(block_i, self.n_freqs)
-            H[freqs] = parallel(
-                parallel_compute_H(A, C, K, z[k], I_n, I_m) for k in freqs
-            )
-
-        return H
-
-    def _partial_covar(self, V, seeds, targets):
-        """Compute partial covariance of a matrix.
-
-        Given a covariance matrix V, the partial covariance matrix of V between
-        indices i and j, given k (V_ij|k), is equivalent to V_ij - V_ik *
-        V_kk^-1 * V_kj. In this case, i and j are seeds, and k are targets.
-
-        See: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        times = np.arange(V.shape[0])
-        W = np.linalg.solve(
-            np.linalg.cholesky(V[np.ix_(times, targets, targets)]),
-            V[np.ix_(times, targets, seeds)],
-        )
-        W = W.transpose(0, 2, 1) @ W
-
-        return V[np.ix_(times, seeds, seeds)] - W
+        if len(self.method) == 1:
+            # for a single method store the connectivity object directly
+            self.connectivity = self.connectivity[0]
 
 
-def _gc_compute_H(A, C, K, z_k, I_n, I_m):
-    """Compute transfer function for innovations-form state-space params.
+def multivariate_spectral_connectivity_epochs(
+    data, indices, names = None, method = "mic", sfreq = 2 * np.pi,
+    mode = "multitaper", tmin = None, tmax = None, fmin = None, fmax = np.inf,
+    fskip = 0, faverage = False, cwt_freqs = None, mt_bandwidth = None,
+    mt_adaptive = False, mt_low_bias = True, cwt_n_cycles = 7.0,
+    n_components = None, gc_n_lags = 20, block_size = 1000, n_jobs = 1,
+    verbose = None,
+):
+    """Compute frequency-domain multivariate connectivity measures.
 
-    See: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-    10.1103/PhysRevE.91.040101, Eq. 4.
+    The connectivity method(s) are specified using the "method" parameter. All
+    methods are based on estimates of the cross-spectral densities (CSD) Sxy.
+
+    Based on the "spectral_connectivity_epochs" function of the
+    "mne-connectivity" package.
+
+    PARAMETERS
+    ----------
+    data : BaseEpochs | array-like
+    -   Data to compute connectivity on. If array-like, must have the dimensions
+        [epochs x signals x timepoints].
+
+    indices : tuple of tuple of array-like of int
+    -   Two tuples of arrays with indices of connections for which to compute
+        connectivity.
+
+    names : list | None; default None
+    -   Names of the channels in the data. If "data" is an Epochs object, these
+        channel names will override those in the object.
+
+    method : str | list of str; default "mic"
+    -   Connectivity measure(s) to compute. These can be ['mic', 'mim', 'gc',
+        'net_gc', 'trgc', 'net_trgc'].
+
+    sfreq : float; default 2 * pi
+    -   Sampling frequency of the data. Only used if "data" is array-like.
+
+    mode : str; default "multitaper"
+    -   Cross-spectral estimation method. Can be 'fourier', 'multitaper', or
+        'cwt_morlet'.
+
+    tmin : float | None; default None
+    -   The time at which to start computing connectivity, in seconds. If None,
+        starts from the first sample.
+
+    tmax : float | None; default None
+    -   The time at which to stop computing connectivity, in seconds. If None,
+        ends with the final sample.
+
+    fmin : float; default 0.0
+    -   Minumum frequency of interest, in Hz. Only used if "mode" is 'fourier'
+        or 'multitaper'.
+
+    fmax : float; default infinity
+    -   Maximum frequency of interest, in Hz. Only used if "mode" is 'fourier'
+        or 'multitaper'.
+    
+    fskip : int; default 0
+    -   Omit every “(fskip + 1)-th” frequency bin to decimate in frequency
+        domain.
+    
+    faverage : bool; default False
+    -   Average connectivity scores for each frequency band. If True, the output
+        freqs will be a list with arrays of the frequencies that were averaged.
+
+    cwt_freqs : list of float | None; default None
+    -   The frequencies of interest, in Hz. If "mode" is 'cwt_morlet', this
+        cannot be None. Only used if "mode" if 'cwt_morlet'.
+
+    mt_bandwidth : float | None; default None
+    -   Bandwidth of the multitaper windowing function, in Hz. Only used if
+        "mode" if 'multitaper'.
+
+    mt_adaptive : bool; default False
+    -   Whether or not to use adaptive weights to combine the tapered spectra
+        into the power spectral density. Only used if "mode" if 'multitaper'.
+
+    mt_low_bias : bool; default True
+    -   Whether or not to only use tapers with over 90% spectral concentration
+        within the bandwidth. Only used if "mode" if 'multitaper'.
+
+    cwt_n_cycles : float | list of float; default 7.0
+    -   Number of cycles to use when constructing the Morlet wavelets. Can be a
+        single number, or one per frequency. Only used if "mode" if
+        'cwt_morlet'.
+
+    n_components : tuple of list of int or str or None | str | None; default
+    None
+    -   Dimensionality reduction parameter specifying the number of seed and
+        target components to extract from the singular value decomposition of
+        the seed and target channels' data, respectively, for each connection.
+        If a str with value "rank", the rank of the seed and target data will be
+        computed and this number of components used. If an entry for a
+        connection is "rank", the data of the seed/target for that connection
+        will have its rank computed and that number of components used. If None,
+        if the entry for the seeds/targets is None, or if an entry for a
+        connection is None, no dimensionality reduction is performed.
+
+    gc_n_lags : int; default 20
+    -   The number of lags to use when computing the autocovariance sequence
+        from the cross-spectral density. Only used if "method" is 'gc',
+        'net_gc', 'trgc', or 'net_trgc'.
+    
+    block_size : int; default 1000
+    -   How many cross-spectral density entries to compute at once (higher
+        numbers are faster but require more memory).
+
+    n_jobs : int; default 1
+    -   Number of jobs to run in parallel when computing the cross-spectral
+        density.
+
+    verbose : bool | str | int | None; default None
+    -   Whether or not to print information about the status of the connectivity
+        computations. See MNE's logging information for further details.
+
+    RETURNS
+    -------
+    results : SpectralConnectivity | list[SpectralConnectivity]
+    -   The connectivity results as a single SpectralConnectivity object (if
+        only one method is called) or a list of SpectralConnectivity objects (if
+        multiple methods are called, where each object is the results for the
+        corresponding entry in "method").
     """
-    from scipy import linalg  # XXX: is this necessary???
+    """Compute frequency- and time-frequency-domain multivariate connectivity
+    measures.
 
-    H = np.zeros((A.shape[0], C.shape[1], C.shape[1]), dtype=np.complex128)
-    for t in range(A.shape[0]):
-        H[t] = I_n + (C[t] @ linalg.lu_solve(linalg.lu_factor(z_k * I_m - A[t]), K[t]))
+    The connectivity method(s) are specified using the "method" parameter.
+    All methods are based on estimates of the cross-spectral density (CSD) Sxy.
 
-    return H
+    Parameters
+    ----------
+    data : array-like, shape=(n_epochs, n_signals, n_times) | Epochs
+        The data from which to compute connectivity. Note that it is also
+        possible to combine multiple signals by providing a list of tuples,
+        e.g., data = [(arr_0, stc_0), (arr_1, stc_1), (arr_2, stc_2)],
+        corresponds to 3 epochs, and arr_* could be an array with the same
+        number of time points as stc_*. The array-like object can also
+        be a list/generator of array, shape =(n_signals, n_times),
+        or a list/generator of SourceEstimate or VolSourceEstimate objects.
+    %(names)s
+    method : str | list of str
+        Connectivity measure(s) to compute. These can be ``['mic', 'mim', 'gc',
+        'net_gc', 'trgc', 'net_trgc']``.
+    indices : tuple of tuple of array
+        Two tuples of arrays with indices of connections for which to compute
+        connectivity.
+    sfreq : float
+        The sampling frequency.
+    mode : str
+        Spectrum estimation mode can be either: 'multitaper', 'fourier', or
+        'cwt_morlet'.
+    fmin : float | tuple of float
+        The lower frequency of interest. Multiple bands are defined using
+        a tuple, e.g., (8., 20.) for two bands with 8Hz and 20Hz lower freq.
+        If None the frequency corresponding to an epoch length of 5 cycles
+        is used.
+    fmax : float | tuple of float
+        The upper frequency of interest. Multiple bands are dedined using
+        a tuple, e.g. (13., 30.) for two band with 13Hz and 30Hz upper freq.
+    fskip : int
+        Omit every "(fskip + 1)-th" frequency bin to decimate in frequency
+        domain.
+    faverage : bool
+        Average connectivity scores for each frequency band. If True,
+        the output freqs will be a list with arrays of the frequencies
+        that were averaged.
+    tmin : float | None
+        Time to start connectivity estimation. Note: when "data" is an array,
+        the first sample is assumed to be at time 0. For other types
+        (Epochs, etc.), the time information contained in the object is used
+        to compute the time indices.
+    tmax : float | None
+        Time to end connectivity estimation. Note: when "data" is an array,
+        the first sample is assumed to be at time 0. For other types
+        (Epochs, etc.), the time information contained in the object is used
+        to compute the time indices.
+    mt_bandwidth : float | None
+        The bandwidth of the multitaper windowing function in Hz.
+        Only used in 'multitaper' mode.
+    mt_adaptive : bool
+        Use adaptive weights to combine the tapered spectra into PSD.
+        Only used in 'multitaper' mode.
+    mt_low_bias : bool
+        Only use tapers with more than 90%% spectral concentration within
+        bandwidth. Only used in 'multitaper' mode.
+    cwt_freqs : array
+        Array of frequencies of interest. Only used in 'cwt_morlet' mode.
+    cwt_n_cycles : float | array of float
+        Number of cycles. Fixed number or one per frequency. Only used in
+        'cwt_morlet' mode.
+    block_size : int
+        How many CSD entries to compute at once (higher numbers are faster
+        but require more memory).
+    n_jobs : int
+        How many epochs and frequencies to process in parallel.
+    %(verbose)s
 
+    Returns
+    -------
+    con : array | list of array
+        Computed connectivity measure(s). Either an instance of
+        ``MultivariateSpectralConnectivity`` or
+        ``MultivariateSpectroTemporalConnectivity``.
+        The shape of each connectivity dataset is (n_con, n_freqs)
+        mode: 'multitaper' or 'fourier' (n_con, n_freqs, n_times)
+        mode: 'cwt_morlet' where "n_con = len(indices[0])".
 
-class _GCEst(_GCEstBase):
-    """[seeds -> targets] state-space GC estimator."""
+    See Also
+    --------
+    mne_connectivity.MultivariateSpectralConnectivity
+    mne_connectivity.MultivariateSpectroTemporalConnectivity
 
-    name = "GC"
+    Notes
+    -----
+    Please note that the interpretation of the measures in this function
+    depends on the data and underlying assumptions and does not necessarily
+    reflect a causal relationship between brain regions.
 
+    These measures are not to be interpreted over time. Each Epoch passed into
+    the dataset is interpreted as an independent sample of the same
+    connectivity structure. Within each Epoch, it is assumed that the spectral
+    measure is stationary. The spectral measures implemented in this function
+    are computed across Epochs. **Thus, spectral measures computed with only
+    one Epoch will result in errorful values.**
 
-class _GCTREst(_GCEstBase):
-    """time-reversed[seeds -> targets] state-space GC estimator."""
+    The spectral densities can be estimated using a multitaper method with
+    digital prolate spheroidal sequence (DPSS) windows, a discrete Fourier
+    transform with Hanning windows, or a continuous wavelet transform using
+    Morlet wavelets. The spectral estimation mode is specified using the
+    "mode" parameter.
 
-    name = "GC time-reversed"
+    By default, the connectivity between all signals is computed (only
+    connections corresponding to the lower-triangular part of the
+    connectivity matrix). If one is only interested in the connectivity
+    between some signals, the "indices" parameter can be used. For example,
+    to compute the connectivity between the signal with index 0 and signals
+    "2, 3, 4" (a total of 3 connections) one can use the following::
 
+        indices = (np.array([0, 0, 0]),    # row indices
+                   np.array([2, 3, 4]))    # col indices
 
-# map names to estimator types
-_CON_METHOD_MAP_MULTIVARIATE = {
-    "cacoh": _CaCohEst,
-    "mic": _MICEst,
-    "mim": _MIMEst,
-    "gc": _GCEst,
-    "gc_tr": _GCTREst,
-}
+        con_flat = spectral_connectivity(data, method='coh',
+                                         indices=indices, ...)
 
-_multivariate_methods = ["cacoh", "mic", "mim", "gc", "gc_tr"]
-_gc_methods = ["gc", "gc_tr"]
-_patterns_methods = ["cacoh", "mic"]  # methods with spatial patterns
-_multicomp_methods = ["cacoh", "mic"]  # methods that support multiple components
+    In this case con_flat.shape = (3, n_freqs). The connectivity scores are
+    in the same order as defined indices.
+
+    **Supported Connectivity Measures**
+
+    The connectivity method(s) is specified using the "method" parameter. The
+    following methods are supported. Multiple measures can be computed at once
+    by using a list/tuple, e.g., ``['mic', 'net_trgc']`` to compute MIC and
+    Net TRGC.
+
+        'mic' : Maximised Imaginary Coherence :footcite:`EwaldEtAl2012`
+            Here, topographies of the connectivity are also computed for each
+            channel, providing spatial information about the connectivity.
+
+        'mim' : Multivariate Interaction Measure :footcite:`EwaldEtAl2012`
+
+        'gc' : Granger causality :footcite:SETHPAPER with connectivity as::
+            [seeds -> targets]
+
+        'net_gc' : Net Granger causality with connectivity as::
+            [seeds -> targets] - [targets -> seeds]
+
+        'trgc' : Time-Reversed Granger causality with connectivity as::
+            [seeds -> targets] - time-reversed[seeds -> targets]
+
+        'net_trgc' : Net Time-Reversed Granger causality with connectivity
+        as::
+            ([seeds -> targets] - [targets -> seeds]) - 
+            (time-reversed[seeds -> targets] - time-reversed[targets -> seeds])
+
+        Time-reversed Granger causality methods are recommended for maximum
+        robustness to noise :footcite:STEFANPAPER.
+
+        'coh' : Coherence given by::
+
+                     | E[Sxy] |
+            C = ---------------------
+                sqrt(E[Sxx] * E[Syy])
+
+        'cohy' : Coherency given by::
+
+                       E[Sxy]
+            C = ---------------------
+                sqrt(E[Sxx] * E[Syy])
+
+        'imcoh' : Imaginary coherence :footcite:`NolteEtAl2004` given by::
+
+                      Im(E[Sxy])
+            C = ----------------------
+                sqrt(E[Sxx] * E[Syy])
+
+        'plv' : Phase-Locking Value (PLV) :footcite:`LachauxEtAl1999` given
+        by::
+
+            PLV = |E[Sxy/|Sxy|]|
+
+        'ciplv' : corrected imaginary PLV (icPLV)
+        :footcite:`BrunaEtAl2018` given by::
+
+                             |E[Im(Sxy/|Sxy|)]|
+            ciPLV = ------------------------------------
+                     sqrt(1 - |E[real(Sxy/|Sxy|)]| ** 2)
+
+        'ppc' : Pairwise Phase Consistency (PPC), an unbiased estimator
+        of squared PLV :footcite:`VinckEtAl2010`.
+
+        'pli' : Phase Lag Index (PLI) :footcite:`StamEtAl2007` given by::
+
+            PLI = |E[sign(Im(Sxy))]|
+
+        'pli2_unbiased' : Unbiased estimator of squared PLI
+        :footcite:`VinckEtAl2011`.
+
+        'dpli' : Directed Phase Lag Index (DPLI) :footcite:`StamEtAl2012`
+        given by (where H is the Heaviside function)::
+
+            DPLI = E[H(Im(Sxy))]
+
+        'wpli' : Weighted Phase Lag Index (WPLI) :footcite:`VinckEtAl2011`
+        given by::
+
+                      |E[Im(Sxy)]|
+            WPLI = ------------------
+                      E[|Im(Sxy)|]
+
+        'wpli2_debiased' : Debiased estimator of squared WPLI
+        :footcite:`VinckEtAl2011`.
+
+    References
+    ----------
+    .. footbibliography::
+    """
+    connectivity_computation = _MVCSpectralEpochs(
+        data=data, indices=indices, names=names, method=method, sfreq=sfreq,
+        mode=mode, tmin=tmin, tmax=tmax, fmin=fmin, fmax=fmax, fskip=fskip,
+        faverage=faverage, cwt_freqs=cwt_freqs, mt_bandwidth=mt_bandwidth,
+        mt_adaptive=mt_adaptive, mt_low_bias=mt_low_bias,
+        cwt_n_cycles=cwt_n_cycles, n_components=n_components,
+        gc_n_lags=gc_n_lags, block_size=block_size, n_jobs=n_jobs,
+        verbose=verbose
+    )
+
+    connectivity_computation.compute_csd_and_connectivity()
+
+    connectivity_computation.store_connectivity_results()
+
+    return connectivity_computation.connectivity

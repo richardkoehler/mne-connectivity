@@ -6,33 +6,18 @@
 #
 # License: BSD (3-clause)
 
-try:
-    from importlib.metadata import version
+__version__ = '0.5.0.dev0'
 
-    __version__ = version("mne")
-except Exception:
-    __version__ = "0.0.0"
-
-from .base import (
-    Connectivity,
-    EpochConnectivity,
-    EpochSpectralConnectivity,
-    EpochSpectroTemporalConnectivity,
-    EpochTemporalConnectivity,
-    SpectralConnectivity,
-    SpectroTemporalConnectivity,
-    TemporalConnectivity,
-)
-from .datasets import make_signals_in_freq_bands
-from .decoding import CoherencyDecomposition
+from .base import (Connectivity, EpochConnectivity, EpochSpectralConnectivity,
+                   EpochSpectroTemporalConnectivity, EpochTemporalConnectivity,
+                   SpectralConnectivity, SpectroTemporalConnectivity,
+                   TemporalConnectivity, MultivariateSpectralConnectivity,
+                   MultivariateSpectroTemporalConnectivity)
 from .effective import phase_slope_index
 from .envelope import envelope_correlation, symmetric_orth
 from .io import read_connectivity
-from .spectral import spectral_connectivity_epochs, spectral_connectivity_time
-from .utils import (
-    check_indices,
-    degree,
-    seed_target_indices,
-    seed_target_multivariate_indices,
-)
-from .vector_ar import select_order, vector_auto_regression
+from .spectral import (spectral_connectivity_time, spectral_connectivity_epochs,
+                       multivariate_spectral_connectivity_epochs)
+from .vector_ar import vector_auto_regression, select_order
+from .utils import (check_indices, degree, seed_target_indices,
+                    multivariate_seed_target_indices)

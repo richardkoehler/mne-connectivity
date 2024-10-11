@@ -5,21 +5,20 @@
 #
 # License: BSD (3-clause)
 
-import inspect
-
 import numpy as np
 from mne import BaseEpochs
 from mne.filter import next_fast_len
 from mne.source_estimate import _BaseSourceEstimate
-from mne.utils import _check_option, _ensure_int, _validate_type, logger, verbose, warn
+from mne.utils import (_check_option, verbose, logger, _validate_type, warn,
+                       _ensure_int)
 
 from .base import EpochTemporalConnectivity
 
 
 @verbose
-def envelope_correlation(
-    data, names=None, orthogonalize="pairwise", log=False, absolute=True, verbose=None
-):
+def envelope_correlation(data, names=None,
+                         orthogonalize="pairwise",
+                         log=False, absolute=True, verbose=None):
     """Compute the envelope correlation.
 
     Parameters
@@ -40,7 +39,7 @@ def envelope_correlation(
         the correlation matrix will not be returned with
         absolute values.
     log : bool
-        If True (default False), square and take the log before orthogonalizing
+        If True (default False), square and take the log before orthonalizing
         envelopes or computing correlations.
     absolute : bool
         If True (default), then take the absolute value of correlation
@@ -51,7 +50,7 @@ def envelope_correlation(
 
     Returns
     -------
-    corr : instance of EpochTemporalConnectivity
+    corr : instance of EpochConnectivity
         The pairwise orthogonal envelope correlations.
         This matrix is symmetric. The array
         will have three dimensions, the first of which is ``n_epochs``.
@@ -59,22 +58,22 @@ def envelope_correlation(
 
     See Also
     --------
-    mne_connectivity.EpochTemporalConnectivity
+    mne_connectivity.EpochConnectivity
 
     Notes
     -----
     This function computes the power envelope correlation between
     orthogonalized signals :footcite:`HippEtAl2012,KhanEtAl2018`.
 
-    If you would like to combine Epochs after the fact using some function over the
-    Epochs axis, see the :meth:`~EpochTemporalConnectivity.combine` method of the
-    :class:`EpochTemporalConnectivity` class.
+    If you would like to combine Epochs after the fact using some
+    function over the Epochs axis, see the ``combine`` function from
+    `EpochConnectivity` classes.
 
     References
     ----------
     .. footbibliography::
-    """
-    _check_option("orthogonalize", orthogonalize, (False, "pairwise"))
+    """  # noqa
+    _check_option('orthogonalize', orthogonalize, (False, 'pairwise'))
     from scipy.signal import hilbert
 
     corrs = list()
@@ -95,22 +94,17 @@ def envelope_correlation(
             annots_in_metadata = False
         else:
             annots_in_metadata = all(
-                name not in metadata.columns
-                for name in ["annot_onset", "annot_duration", "annot_description"]
-            )
-        if hasattr(data, "annotations") and not annots_in_metadata:
+                name not in metadata.columns for name in [
+                    'annot_onset', 'annot_duration', 'annot_description'])
+        if hasattr(data, 'annotations') and not annots_in_metadata:
             data.add_annotations_to_metadata(overwrite=True)
         metadata = data.metadata
         # get the actual data in numpy
-        # XXX: remove logic once support for mne<1.6 is dropped
-        kwargs = dict()
-        if "copy" in inspect.getfullargspec(data.get_data).kwonlyargs:
-            kwargs["copy"] = False
-        data = data.get_data(**kwargs)
+        data = data.get_data()
     else:
         metadata = None
 
-    # Note: This is embarrassingly parallel, but the overhead of sending
+    # Note: This is embarassingly parallel, but the overhead of sending
     # the data to different workers is roughly the same as the gain of
     # using multiple CPUs. And we require too much GIL for prefer='threading'
     # to help.
@@ -118,15 +112,13 @@ def envelope_correlation(
         if isinstance(epoch_data, _BaseSourceEstimate):
             epoch_data = epoch_data.data
         if epoch_data.ndim != 2:
-            raise ValueError(
-                f"Each entry in data must be 2D, got shape {epoch_data.shape}"
-            )
+            raise ValueError('Each entry in data must be 2D, got shape %s'
+                             % (epoch_data.shape,))
         n_nodes, n_times = epoch_data.shape
         if ei > 0 and n_nodes != corrs[0].shape[0]:
-            raise ValueError(
-                f"n_nodes mismatch between data[0] and data[{ei}], got {n_nodes} and "
-                f"{corrs[0].shape[0]}"
-            )
+            raise ValueError('n_nodes mismatch between data[0] and data[%d], '
+                             'got %s and %s'
+                             % (ei, n_nodes, corrs[0].shape[0]))
 
         # Get the complex envelope (allowing complex inputs allows people
         # to do raw.apply_hilbert if they want)
@@ -135,9 +127,8 @@ def envelope_correlation(
             epoch_data = hilbert(epoch_data, N=n_fft, axis=-1)[..., :n_times]
 
         if not np.iscomplexobj(epoch_data):
-            raise ValueError(
-                f"data.dtype must be float or complex, got {epoch_data.dtype}"
-            )
+            raise ValueError('data.dtype must be float or complex, got %s'
+                             % (epoch_data.dtype,))
         data_mag = np.abs(epoch_data)
         data_conj_scaled = epoch_data.conj()
         data_conj_scaled /= data_mag
@@ -164,11 +155,12 @@ def envelope_correlation(
                 np.abs(label_data_orth, out=label_data_orth)
                 # protect against invalid value -- this will be zero
                 # after (log and) mean subtraction
-                label_data_orth[li] = 1.0
+                label_data_orth[li] = 1.
                 if log:
                     label_data_orth *= label_data_orth
                     np.log(label_data_orth, out=label_data_orth)
-                label_data_orth -= np.mean(label_data_orth, axis=-1, keepdims=True)
+                label_data_orth -= np.mean(label_data_orth, axis=-1,
+                                           keepdims=True)
                 label_data_orth_std = np.linalg.norm(label_data_orth, axis=-1)
                 label_data_orth_std[label_data_orth_std == 0] = 1
 
@@ -180,13 +172,13 @@ def envelope_correlation(
             # Make it symmetric (it isn't at this point)
             if absolute:
                 corr = np.abs(corr)
-            corr = (corr.T + corr) / 2.0
+            corr = (corr.T + corr) / 2.
 
         corrs.append(corr)
         del corr
 
     if n_nodes is None:
-        raise RuntimeError("Passing in empty epochs object is not allowed.")
+        raise RuntimeError('Passing in empty epochs object is not allowed.')
 
     # apply function on correlation structure
     n_epochs = len(corrs)
@@ -203,20 +195,21 @@ def envelope_correlation(
 
     # only get the upper-triu indices
     triu_inds = np.triu_indices(n_nodes, k=0)
-    raveled_triu_inds = np.ravel_multi_index(triu_inds, dims=(n_nodes, n_nodes))
+    raveled_triu_inds = np.ravel_multi_index(
+        triu_inds, dims=(n_nodes, n_nodes))
     corr = corr[:, raveled_triu_inds, ...]
 
     conn = EpochTemporalConnectivity(
         data=corr,
         names=names,
         times=times,
-        method="envelope correlation",
-        indices="symmetric",
+        method='envelope correlation',
+        indices='symmetric',
         n_epochs_used=n_epochs,
         n_nodes=n_nodes,
         events=events,
         event_id=event_id,
-        metadata=metadata,
+        metadata=metadata
     )
     return conn
 
@@ -249,7 +242,7 @@ def symmetric_orth(data, *, n_iter=50, tol=1e-6, verbose=None):
     ----------
     .. footbibliography::
     """
-    n_iter = _ensure_int(n_iter, "n_iter")
+    n_iter = _ensure_int(n_iter, 'n_iter')
     if isinstance(data, np.ndarray):
         return_generator = False
         if data.ndim == 2:
@@ -270,27 +263,26 @@ def symmetric_orth(data, *, n_iter=50, tol=1e-6, verbose=None):
 
 def _gen_sym_orth(data, n_iter, tol):
     for ei, Z in enumerate(data):
-        name = f"data[{ei}]"
+        name = f'data[{ei}]'
         _validate_type(Z, np.ndarray, name)
-        _check_option(f"{name}.ndim", Z.ndim, (2,))
-        _check_option(f"{name}.dtype.kind", Z.dtype.kind, "f")
+        _check_option(f'{name}.ndim', Z.ndim, (2,))
+        _check_option(f'{name}.dtype.kind', Z.dtype.kind, 'f')
         # implementation follows Colclough et al. 2015 (NeuroImage), quoted
         # below the paper formulation has Z of shape (m, n) with m time points
         # and n sensors, but let's reformulate to our dimensionality
         n, m = Z.shape
         if m < n:
             raise RuntimeError(
-                f"Symmetric orth requires at least as many time points ({m}) as the "
-                f"number of time series ({n})"
-            )
-        logger.debug("Symmetric orth")
+                f'Symmetric orth requires at least as many time points ({m}) '
+                f'as the number of time series ({n})')
+        logger.debug('Symmetric orth')
         # "starting with D(1) = I_n"
         d = np.ones(n)  # don't bother with making it full diag
         # "we then allow the vector magnitudes to vary and reduce the error ε
         # by iterating (4), (6) and (8) until convergence."
         last_err = np.inf
-        power = np.linalg.norm(Z, "fro") ** 2
-        power = power or 1.0
+        power = np.linalg.norm(Z, 'fro') ** 2
+        power = power or 1.
         P = None
         rank = None
         for ii in range(n_iter):
@@ -301,28 +293,26 @@ def _gen_sym_orth(data, n_iter, tol):
                 rank = this_rank
                 # Use single precision here (should be good enough)
                 if rank < len(Z):
-                    warn(
-                        f"Data are rank deficient ({rank} < {len(Z)}), some "
-                        "orthogonalized components will be noise"
-                    )
+                    warn(f'Data are rank deficient ({rank} < {len(Z)}), some '
+                         'orthogonalized components will be noise')
             # eq. 6 with an added transpose
             O_ = Vh.T @ U.T
             # eq. 8 (D=diag(diag(Z^T O)))
-            d = np.einsum("ij,ij->i", Z, O_)
+            d = np.einsum('ij,ij->i', Z, O_)
             # eq. 2 (P=OD) with an added transpose
             O_ *= d[:, np.newaxis]
             P = O_
             err = _ep(Z, P) / power
             delta = 0 if err == 0 else (last_err - err) / err
-            logger.debug(f"    {ii:2d}: ε={delta:0.2e} ({err}; r={this_rank})")
+            logger.debug(f'    {ii:2d}: ε={delta:0.2e} ({err}; r={this_rank})')
             if err == 0 or delta < tol:
-                logger.debug(f"Convergence reached on iteration {ii}")
+                logger.debug(f'Convergence reached on iteration {ii}')
                 break
             last_err = err
         else:
-            warn(f"Symmetric orth did not converge for data[{ei}]")
+            warn(f'Symmetric orth did not converge for data[{ei}]')
         yield P
 
 
 def _ep(Z, P):
-    return np.linalg.norm(Z - P, "fro") ** 2
+    return np.linalg.norm(Z - P, 'fro') ** 2

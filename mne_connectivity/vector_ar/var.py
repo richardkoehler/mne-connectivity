@@ -1,30 +1,21 @@
-import inspect
-
 import numpy as np
 import scipy
-from mne import BaseEpochs
-from mne.utils import logger, verbose
 from scipy.linalg import sqrtm
 from tqdm import tqdm
+from mne import BaseEpochs
 
-from ..base import Connectivity, EpochConnectivity, EpochTemporalConnectivity
+from mne.utils import logger, verbose
+
 from ..utils import fill_doc
+from ..base import Connectivity, EpochConnectivity, EpochTemporalConnectivity
 
 
 @verbose
 @fill_doc
 def vector_auto_regression(
-    data,
-    times=None,
-    names=None,
-    lags=1,
-    l2_reg=0.0,
-    compute_fb_operator=False,
-    model="dynamic",
-    n_jobs=1,
-    verbose=None,
-):
-    r"""Compute vector auto-regresssive (VAR) model.
+        data, times=None, names=None, lags=1, l2_reg=0.0,
+        compute_fb_operator=False, model='dynamic', n_jobs=1, verbose=None):
+    """Compute vector auto-regresssive (VAR) model.
 
     Parameters
     ----------
@@ -54,14 +45,13 @@ def vector_auto_regression(
 
     Returns
     -------
-    conn : Connectivity | EpochConnectivity | EpochTemporalConnectivity
+    conn : Connectivity | TemporalConnectivity | EpochConnectivity
         The connectivity data estimated.
 
     See Also
     --------
     mne_connectivity.Connectivity
     mne_connectivity.EpochConnectivity
-    mne_connectivity.EpochTemporalConnectivity
 
     Notes
     -----
@@ -88,7 +78,7 @@ def vector_auto_regression(
     from the following model over **all** epochs:
 
     .. math::
-        X(t+1) = \sum_{i=0}^{order} A_i X(t-i)
+        X(t+1) = \\sum_{i=0}^{order} A_i X(t-i)
 
     This results in one VAR model over all the epochs.
 
@@ -99,7 +89,7 @@ def vector_auto_regression(
     would be the following for **each** epoch:
 
     .. math::
-        X(t+1) = \sum_{i=0}^{order} A_i X(t-i)
+        X(t+1) = \\sum_{i=0}^{order} A_i X(t-i)
 
     This results in one VAR model for each epoch. This is done according
     to the model in :footcite:`li_linear_2017`.
@@ -127,11 +117,10 @@ def vector_auto_regression(
     References
     ----------
     .. footbibliography::
-    """
-    if model not in ["avg-epochs", "dynamic"]:
-        raise ValueError(
-            f'"model" parameter must be one of ' f"(avg-epochs, dynamic), not {model}."
-        )
+    """  # noqa
+    if model not in ['avg-epochs', 'dynamic']:
+        raise ValueError(f'"model" parameter must be one of '
+                         f'(avg-epochs, dynamic), not {model}.')
 
     events = None
     event_id = None
@@ -148,20 +137,14 @@ def vector_auto_regression(
             annots_in_metadata = False
         else:
             annots_in_metadata = all(
-                name not in metadata.columns
-                for name in ["annot_onset", "annot_duration", "annot_description"]
-            )
-        if hasattr(data, "annotations") and not annots_in_metadata:
+                name not in metadata.columns for name in [
+                    'annot_onset', 'annot_duration', 'annot_description'])
+        if hasattr(data, 'annotations') and not annots_in_metadata:
             data.add_annotations_to_metadata(overwrite=True)
         metadata = data.metadata
 
         # get the actual data in numpy
-        # get the actual data in numpy
-        # XXX: remove logic once support for mne<1.6 is dropped
-        kwargs = dict()
-        if "copy" in inspect.getfullargspec(data.get_data).kwonlyargs:
-            kwargs["copy"] = False
-        data = data.get_data(**kwargs)
+        data = data.get_data()
     else:
         metadata = None
 
@@ -169,16 +152,15 @@ def vector_auto_regression(
     n_epochs, n_nodes, _ = data.shape
 
     model_params = {
-        "lags": lags,
-        "l2_reg": l2_reg,
+        'lags': lags,
+        'l2_reg': l2_reg,
     }
 
     if verbose:
-        logger.info(
-            f"Running {model} vector autoregression with parameters: \n{model_params}"
-        )
+        logger.info(f'Running {model} vector autoregression with parameters: '
+                    f'\n{model_params}')
 
-    if model == "avg-epochs":
+    if model == 'avg-epochs':
         # compute VAR model where each epoch is a
         # sample of the multivariate time-series of interest
         # ordinary least squares or regularized least squares
@@ -192,58 +174,41 @@ def vector_auto_regression(
 
         # create connectivity
         coef = coef.flatten()
-        conn = Connectivity(
-            data=coef,
-            n_nodes=n_nodes,
-            names=names,
-            n_epochs_used=n_epochs,
-            times_used=times,
-            method="VAR",
-            metadata=metadata,
-            events=events,
-            event_id=event_id,
-            **model_params,
-        )
+        conn = Connectivity(data=coef, n_nodes=n_nodes, names=names,
+                            n_epochs_used=n_epochs,
+                            times_used=times,
+                            method='VAR', metadata=metadata,
+                            events=events, event_id=event_id,
+                            **model_params)
     else:
-        assert model == "dynamic"
+        assert model == 'dynamic'
         # compute time-varying VAR model where each epoch
         # is one sample of a time-varying multivariate time-series
         # linear system
         A_mats = _system_identification(
-            data=data,
-            lags=lags,
-            l2_reg=l2_reg,
-            n_jobs=n_jobs,
-            compute_fb_operator=compute_fb_operator,
-        )
+            data=data, lags=lags,
+            l2_reg=l2_reg, n_jobs=n_jobs,
+            compute_fb_operator=compute_fb_operator)
         # create connectivity
         if lags > 1:
-            conn = EpochTemporalConnectivity(
-                data=A_mats,
-                times=list(range(lags)),
-                n_nodes=n_nodes,
-                names=names,
-                n_epochs_used=n_epochs,
-                times_used=times,
-                method="Time-varying VAR(p)",
-                metadata=metadata,
-                events=events,
-                event_id=event_id,
-                **model_params,
-            )
+            conn = EpochTemporalConnectivity(data=A_mats,
+                                             times=list(range(lags)),
+                                             n_nodes=n_nodes, names=names,
+                                             n_epochs_used=n_epochs,
+                                             times_used=times,
+                                             method='Time-varying VAR(p)',
+                                             metadata=metadata,
+                                             events=events, event_id=event_id,
+                                             **model_params)
         else:
-            conn = EpochConnectivity(
-                data=A_mats,
-                n_nodes=n_nodes,
-                names=names,
-                n_epochs_used=n_epochs,
-                times_used=times,
-                method="Time-varying VAR(1)",
-                metadata=metadata,
-                events=events,
-                event_id=event_id,
-                **model_params,
-            )
+            conn = EpochConnectivity(data=A_mats, n_nodes=n_nodes,
+                                     names=names,
+                                     n_epochs_used=n_epochs,
+                                     times_used=times,
+                                     method='Time-varying VAR(1)',
+                                     metadata=metadata,
+                                     events=events, event_id=event_id,
+                                     **model_params)
     return conn
 
 
@@ -293,7 +258,8 @@ def _construct_var_eqns(data, lags, l2_reg=None):
     X = np.zeros((rows, n_signals * lags))
     for i in range(n_signals):
         for k in range(1, lags + 1):
-            X[:n, i * lags + k - 1] = np.reshape(data[:, i, lags - k : -k].T, n)
+            X[:n, i * lags + k -
+                1] = np.reshape(data[:, i, lags - k:-k].T, n)
 
     if l2_reg is not None:
         np.fill_diagonal(X[n:, :], l2_reg)
@@ -306,13 +272,14 @@ def _construct_var_eqns(data, lags, l2_reg=None):
     return X, Y
 
 
-def _system_identification(data, lags, l2_reg=0, n_jobs=-1, compute_fb_operator=False):
-    r"""Solve system identification using least-squares over all epochs.
+def _system_identification(data, lags, l2_reg=0,
+                           n_jobs=-1, compute_fb_operator=False):
+    """Solve system identification using least-squares over all epochs.
 
     Treats each epoch as a different window of time to estimate the model:
 
     .. math::
-        X(t+1) = \sum_{i=0}^{order} A_i X(t - i)
+        X(t+1) = \\sum_{i=0}^{order} A_i X(t - i)
 
     where ``data`` comprises of ``(n_signals, n_times)`` and ``X(t)`` are
     the data snapshots.
@@ -321,9 +288,9 @@ def _system_identification(data, lags, l2_reg=0, n_jobs=-1, compute_fb_operator=
     n_epochs, n_nodes, n_times = data.shape
 
     model_params = {
-        "l2_reg": l2_reg,
-        "lags": lags,
-        "compute_fb_operator": compute_fb_operator,
+        'l2_reg': l2_reg,
+        'lags': lags,
+        'compute_fb_operator': compute_fb_operator
     }
 
     # storage for the A matrices, residuals and sum of squared estimated errors
@@ -334,12 +301,13 @@ def _system_identification(data, lags, l2_reg=0, n_jobs=-1, compute_fb_operator=
     # compute the A matrix for all Epochs
     if n_jobs == 1:
         for idx in tqdm(range(n_epochs)):
-            adjmat, resid, omega = _compute_lds_func(data[idx, ...], **model_params)
+            adjmat, resid, omega = _compute_lds_func(
+                data[idx, ...], **model_params)
             # add additional order models in dynamic connectivity
             # along the first node axes
             for jdx in range(lags):
                 A_mats[idx, :, :, jdx] = adjmat[
-                    jdx * n_nodes : n_nodes * (jdx + 1), :
+                    jdx * n_nodes: n_nodes * (jdx + 1), :
                 ].T
             residuals[idx, ...] = resid.T
             sse_matrix[idx, ...] = omega
@@ -353,7 +321,9 @@ def _system_identification(data, lags, l2_reg=0, n_jobs=-1, compute_fb_operator=
 
         # run parallelized job to compute over all windows
         results = Parallel(n_jobs=n_jobs)(
-            delayed(_compute_lds_func)(arr[idx, ...], **model_params)
+            delayed(_compute_lds_func)(
+                arr[idx, ...], **model_params
+            )
             for idx in tqdm(range(n_epochs))
         )
         for idx in range(len(results)):
@@ -365,7 +335,7 @@ def _system_identification(data, lags, l2_reg=0, n_jobs=-1, compute_fb_operator=
             # along the first node axes
             for jdx in range(lags):
                 A_mats[idx, :, :, jdx] = adjmat[
-                    jdx * n_nodes : n_nodes * (jdx + 1), :
+                    jdx * n_nodes: n_nodes * (jdx + 1), :
                 ].T
 
     # ravel the matrix
@@ -401,14 +371,14 @@ def _compute_lds_func(data, lags, l2_reg, compute_fb_operator):
 
     # get time-shifted versions
     X = data[:, :]
-    A, resid, omega = _estimate_var(X, lags=lags, offset=0, l2_reg=l2_reg)
+    A, resid, omega = _estimate_var(X, lags=lags, offset=0,
+                                    l2_reg=l2_reg)
 
     if compute_fb_operator:
         # compute backward linear operator
         # original method
         back_A, back_resid, back_omega = _estimate_var(
-            X[::-1, :], lags=lags, offset=0, l2_reg=l2_reg
-        )
+            X[::-1, :], lags=lags, offset=0, l2_reg=l2_reg)
         A = sqrtm(A.dot(np.linalg.inv(back_A)))
         A = A.real  # remove numerical noise
 
@@ -454,16 +424,17 @@ def _estimate_var(X, lags, offset=0, l2_reg=0):
     # with lags and trends.
     # Note that the pure endogenous VAR model with OLS
     # makes this matrix a (n_samples - lags, n_channels * lags) matrix
-    temp_z = _get_var_predictor_matrix(endog, lags)
+    temp_z = _get_var_predictor_matrix(
+        endog, lags
+    )
     z = temp_z
 
     y_sample = endog[lags:]
     del endog, X
     # Lütkepohl p75, about 5x faster than stated formula
     if l2_reg != 0:
-        params = np.linalg.lstsq(
-            z.T @ z + l2_reg * np.eye(n_equations * lags), z.T @ y_sample, rcond=1e-15
-        )[0]
+        params = np.linalg.lstsq(z.T @ z + l2_reg * np.eye(n_equations * lags),
+                                 z.T @ y_sample, rcond=1e-15)[0]
     else:
         params = np.linalg.lstsq(z, y_sample, rcond=1e-15)[0]
 
@@ -504,15 +475,13 @@ def _test_forloop(X, lags, offset=0, l2_reg=0):
     y_component = np.zeros((1, n_channels))
     for idx in range(n_times - lags):
         for jdx in range(lags):
-            first_component[jdx * n_equations : (jdx + 1) * n_equations, :] = endog[
-                idx + jdx, :
-            ][:, np.newaxis]
-            second_component[:, jdx * n_equations : (jdx + 1) * n_equations] = endog[
-                idx + jdx, :
-            ][np.newaxis, :]
-            y_component[:, jdx * n_equations : (jdx + 1) * n_equations] = endog[
-                idx + 1 + jdx, :
-            ][np.newaxis, :]
+            first_component[
+                jdx * n_equations: (jdx + 1) * n_equations, :] = \
+                endog[idx + jdx, :][:, np.newaxis]
+            second_component[:, jdx * n_equations: (
+                jdx + 1) * n_equations] = endog[idx + jdx, :][np.newaxis, :]
+            y_component[:, jdx * n_equations: (jdx + 1) *
+                        n_equations] = endog[idx + 1 + jdx, :][np.newaxis, :]
         # second_component = np.hstack([endog[idx + jdx, :]
         # for jdx in range(lags)])[np.newaxis, :]
         # print(second_component.shape)
@@ -526,8 +495,7 @@ def _test_forloop(X, lags, offset=0, l2_reg=0):
 
     if l2_reg != 0:
         final_params = np.linalg.lstsq(
-            XdotX + l2_reg * np.eye(n_equations * lags), XdotY, rcond=1e-15
-        )[0]
+            XdotX + l2_reg * np.eye(n_equations * lags), XdotY, rcond=1e-15)[0]
     else:
         final_params = np.linalg.lstsq(XdotX, XdotY, rcond=1e-15)[0].T
 
@@ -539,8 +507,7 @@ def _test_forloop(X, lags, offset=0, l2_reg=0):
         start_row = n_equations * (lags - idx - 1)
         stop_row = n_equations * (lags - idx)
         params[start_row:stop_row, ...] = final_params[
-            n_equations * (lags - 1) :, start_col:stop_col
-        ].T
+            n_equations * (lags - 1):, start_col:stop_col].T
 
     # print(final_params.round(5))
     # print(params_)
@@ -550,7 +517,7 @@ def _test_forloop(X, lags, offset=0, l2_reg=0):
     # Note that the pure endogenous VAR model with OLS
     # makes this matrix a (n_samples - lags, n_channels * lags) matrix
     # z = _get_var_predictor_matrix(
-    # endog, lags
+        # endog, lags
     # )
     # (n_samples - lags, n_channels)
     # resid = y_sample - np.dot(z, params)
@@ -590,6 +557,6 @@ def _get_var_predictor_matrix(y, lags):
     """
     nobs = len(y)
     # Ravel C order, need to put in descending order
-    Z = np.array([y[t - lags : t][::-1].ravel() for t in range(lags, nobs)])
+    Z = np.array([y[t - lags: t][::-1].ravel() for t in range(lags, nobs)])
 
     return Z

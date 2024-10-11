@@ -1,0 +1,14 @@
+pytest
+pytest-cov
+pytest-timeout
+numpydoc
+pydocstyle
+flake8
+numpydoc
+codespell
+check-manifest
+twine
+wheel
+statsmodels
+scikit-learn
+https://github.com/mne-tools/mne-bids/archive/main.zip

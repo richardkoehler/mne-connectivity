@@ -1,0 +1,14 @@
+memory_profiler
+sphinx<6.0
+sphinx-gallery
+sphinx_rtd_theme
+sphinx-copybutton
+numpydoc
+nibabel
+nilearn
+https://github.com/pydata/pydata-sphinx-theme/archive/cef3e724e15852fc2a84bee256c457c9497834b8.zip
+typing-extensions
+sphinx-autodoc-typehints
+sphinxcontrib-bibtex
+https://github.com/mne-tools/mne-bids/archive/main.zip
+pooch
